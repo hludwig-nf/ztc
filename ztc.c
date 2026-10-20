@@ -18,9 +18,18 @@
 #include <math.h>
 #include <stdint.h>
 
+#include <sys/utsname.h>
+
 #include <openssl/sha.h>
 
-#define ZTC_VERSION "0.1"
+#define ZTC_VERSION     "0.26"   /* ztc itself; understands both language versions */
+#define ZTC_VERSION_P26 "0.1"    /* ztc as seen by -ztv=p26 */
+
+/* -ztv=p26    -> ZTSL p26   (ztc 0.1, original syntax, default)
+ * -ztv=ztsl26 -> ZTSL 26    (ztc 0.26, def_mod / run.func / argument guards) */
+typedef enum { ZTV_P26, ZTV_ZTSL26 } ZtVer;
+static ZtVer g_ztv    = ZTV_P26;
+static bool  g_memchk = false;   /* -libmemchk (built in) */
 
 static void *xmalloc(size_t n) {
     void *p = malloc(n);
@@ -114,6 +123,8 @@ static const char *suggest_keyword(const char *word) {
         "read_file", "delete_file", "create_file",
         "write_on_file", "append_file", "ccompat",
         "calculate",
+        "def_mod", "run.func", "sys.exec.silent", "endif",
+        "mem.alloc", "mem.free", "mem.write", "mem.show",
         NULL
     };
     size_t wlen = 0;
@@ -195,6 +206,20 @@ static void dstr_append_char(dstring *d, char c) {
     d->data[d->len] = '\0';
 }
 
+static void dstr_appendf(dstring *d, const char *fmt, ...) {
+    va_list ap, ap2;
+    va_start(ap, fmt);
+    va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n >= 0) {
+        dstr_reserve(d, d->len + (size_t)n);
+        vsnprintf(d->data + d->len, (size_t)n + 1, fmt, ap2);
+        d->len += (size_t)n;
+    }
+    va_end(ap2);
+}
+
 typedef struct {
     char **lines;
     size_t count;
@@ -259,10 +284,23 @@ static void file_to_lines(const char *content, LineBuf *lb) {
         }
 
         if (*p == '\n') {
-            
-            char *line = str_trim_dup(cur.data);
-            if (line[0] != '\0') linebuf_push(lb, line);
-            else free(line);
+            /* Inside a ``` block the body is kept verbatim (indentation and
+             * blank lines survive: text.show / write_on_file used to lose
+             * both). The fence lines themselves are still trimmed. */
+            const char *t = cur.data;
+            while (*t && isspace((unsigned char)*t)) t++;
+            bool fence_line = (strncmp(t, "```", 3) == 0);
+            char *line;
+            if (in_code_fence && !fence_line) {
+                line = xstrdup(cur.data);
+                size_t ll = strlen(line);
+                while (ll > 0 && line[ll - 1] == '\r') line[--ll] = '\0';
+                linebuf_push(lb, line);
+            } else {
+                line = str_trim_dup(cur.data);
+                if (line[0] != '\0') linebuf_push(lb, line);
+                else free(line);
+            }
             dstr_free(&cur);
             dstr_init(&cur);
             p++;
@@ -293,11 +331,18 @@ typedef enum {
     K_APPEND,
     K_CCOMPAT,
     K_FLOATCALC,
+    K_RUNFUNC,
+    K_MEMALLOC,
+    K_MEMFREE,
+    K_MEMWRITE,
+    K_MEMSHOW,
 } StmtKind;
 
 typedef enum {
     COND_EQ,
     COND_EMPTYFILE,
+    COND_ARG_PASSED,   /* if argument NAME is passed [with %ea%] */
+    COND_ARG_UNDEF,    /* if argument is not defined */
 } CondKind;
 
 typedef enum {
@@ -317,6 +362,8 @@ typedef struct {
     bool     is_is;        
     char   **values;       
     size_t   nvalues;
+    char    *argname;      /* COND_ARG_PASSED */
+    bool     need_ea;      /* ... with %ea% */
     Stmt    *then_branch;  
     Stmt    *else_branch;
 } Cond;
@@ -327,13 +374,15 @@ struct Stmt {
     union {
         struct { char *name; char *value; } define;
         Cond     cond;
-        struct { bool is_shell; char *code; } exec;
+        struct { bool is_shell; bool silent; char *code; } exec;
         struct { char *code; } show;
         struct { char *path; } delfile;
         struct { char *path; } mkfile;
         struct { char *path; char *code; } writefile;
         struct { char *code; } ccompat;
         struct { int width; char op; char *lhs_raw; char *rhs_raw; char *varname; } floatcalc;
+        struct { char *name; } runfunc;
+        struct { char *name; char *num; char *text; } mem;
     };
 };
 
@@ -353,6 +402,8 @@ typedef struct {
     Func *funcs;
     Var  *vars;
     bool  inline_ztslo_used;
+    char **mods;      /* def_mod names (ztsl26) */
+    size_t nmods;
 } Program;
 
 typedef struct {
@@ -360,6 +411,7 @@ typedef struct {
     size_t   pos;
     bool     error;
     char    *err_msg;
+    int      if_depth;   /* nesting of 'if' being parsed */
 } Parser;
 
 static void parse_error(Parser *p, const char *msg) {
@@ -430,6 +482,7 @@ static void stmt_free(Stmt *s) {
             case K_IF:
                 free(s->cond.var);
                 free(s->cond.path);
+                free(s->cond.argname);
                 for (size_t i = 0; i < s->cond.nvalues; i++)
                     free(s->cond.values[i]);
                 free(s->cond.values);
@@ -460,6 +513,17 @@ static void stmt_free(Stmt *s) {
                 free(s->floatcalc.lhs_raw);
                 free(s->floatcalc.rhs_raw);
                 free(s->floatcalc.varname);
+                break;
+            case K_RUNFUNC:
+                free(s->runfunc.name);
+                break;
+            case K_MEMALLOC:
+            case K_MEMFREE:
+            case K_MEMWRITE:
+            case K_MEMSHOW:
+                free(s->mem.name);
+                free(s->mem.num);
+                free(s->mem.text);
                 break;
         }
         free(s);
@@ -688,6 +752,8 @@ static bool reject_if_misplaced_statement(Parser *p, const char *line) {
         "delete_file", "create_file",
         "write_on_file", "append_file",
         "ccompat",
+        "sys.exec.silent", "run.func",
+        "mem.alloc", "mem.free", "mem.write", "mem.show",
         NULL
     };
     for (size_t i = 0; stmt_keywords[i]; i++) {
@@ -699,6 +765,68 @@ static bool reject_if_misplaced_statement(Parser *p, const char *line) {
         }
     }
     return false;
+}
+
+static char *skip_ws(char *s) {
+    while (*s && isspace((unsigned char)*s)) s++;
+    return s;
+}
+
+/* Consumes the whole word 'w' (case-insensitive) plus the blanks after it. */
+static bool take_word(char **sp, const char *w) {
+    size_t n = strlen(w);
+    if (!match_word_boundary(*sp, w, n)) return false;
+    *sp = skip_ws(*sp + n);
+    return true;
+}
+
+/* Reads a "quoted" or bare name. Returns a malloc'd string or NULL. */
+static char *take_name(char **sp) {
+    char *s = skip_ws(*sp);
+    if (*s == '"') {
+        const char *endp = NULL;
+        char *out = extract_quoted(s, &endp);
+        if (!out) return NULL;
+        *sp = skip_ws((char *)endp);
+        return out;
+    }
+    char *start = s;
+    while (*s && !isspace((unsigned char)*s)) s++;
+    if (s == start) return NULL;
+    char *out = xstrndup(start, (size_t)(s - start));
+    *sp = skip_ws(s);
+    return out;
+}
+
+static bool require_ztsl26(Parser *p, const char *what) {
+    if (g_ztv == ZTV_ZTSL26) return true;
+    zt_error("'%s' is only available with -ztv=ztsl26", what);
+    parse_error(p, "ztsl26-only construct used in p26 mode");
+    return false;
+}
+
+/* Takes ownership of 'name'. */
+static void prog_add_mod(Program *prog, char *name) {
+    for (size_t i = 0; i < prog->nmods; i++) {
+        if (strcmp(prog->mods[i], name) == 0) { free(name); return; }
+    }
+    prog->mods = xrealloc(prog->mods, sizeof(char *) * (prog->nmods + 1));
+    prog->mods[prog->nmods++] = name;
+}
+
+static void prog_free_mods(Program *prog) {
+    for (size_t i = 0; i < prog->nmods; i++) free(prog->mods[i]);
+    free(prog->mods);
+    prog->mods = NULL;
+    prog->nmods = 0;
+}
+
+/* "if argument ..." */
+static bool is_arg_guard_line(const char *line) {
+    if (!starts_with_kw(line, "if")) return false;
+    line += 2;
+    while (*line && isspace((unsigned char)*line)) line++;
+    return match_word_boundary(line, "argument", 8);
 }
 
 static Stmt *parse_if(Parser *p) {
@@ -715,8 +843,47 @@ static Stmt *parse_if(Parser *p) {
     CondSubj subj = SUBJ_VAR;
     char *var = NULL;
     char *fpath = NULL;
+    char *argname = NULL;
+    bool need_ea = false;
+    bool is_is = true;
+    CondKind ckind = COND_EQ;
+    char **values = NULL;
+    size_t nvalues = 0, cap = 0;
+    bool seen_then = false;
 
-    if (match_word_boundary(s, "read_file", 9)) {
+    if (g_ztv == ZTV_ZTSL26 && match_word_boundary(s, "argument", 8)) {
+        /* if argument <name> is passed [with %ea%]  |  if argument is not defined */
+        s = skip_ws(s + 8);
+        if (take_word(&s, "is")) {
+            if (!take_word(&s, "not") || !take_word(&s, "defined")) {
+                parse_error(p, "expected 'if argument is not defined'");
+                free(line);
+                return NULL;
+            }
+            ckind = COND_ARG_UNDEF;
+        } else {
+            argname = take_name(&s);
+            if (!argname || !take_word(&s, "is") || !take_word(&s, "passed")) {
+                parse_error(p, "expected 'if argument <name> is passed [with %ea%]'");
+                free(line);
+                free(argname);
+                return NULL;
+            }
+            ckind = COND_ARG_PASSED;
+            if (take_word(&s, "with")) {
+                if (!take_word(&s, "%ea%")) {
+                    parse_error(p, "expected '%ea%' after 'with'");
+                    free(line);
+                    free(argname);
+                    return NULL;
+                }
+                need_ea = true;
+            }
+        }
+        if (take_word(&s, "then")) seen_then = true;
+        free(line);
+        goto if_build;
+    } else if (match_word_boundary(s, "read_file", 9)) {
         s += 9;
         while (*s && isspace((unsigned char)*s)) s++;
         const char *endp = NULL;
@@ -743,30 +910,34 @@ static Stmt *parse_if(Parser *p) {
     }
 
     
-    bool is_is;
-    CondKind ckind = COND_EQ;
-    char **values = NULL;
-    size_t nvalues = 0, cap = 0;
-    bool seen_then = false;
 
-    if (subj == SUBJ_VAR && match_word_boundary(s, "is not an empty file", 21)) {
+    /* NB: "is not an empty file" is 20 characters (it used to be 21: the
+     * matcher read one byte past the terminator and never matched when
+     * 'then' followed on the same line). */
+    if (subj == SUBJ_VAR && match_word_boundary(s, "is not an empty file", 20)) {
         ckind = COND_EMPTYFILE;
         is_is = false;
-        s += 21;
+        s += 20;
     } else if (subj == SUBJ_VAR && match_word_boundary(s, "is an empty file", 16)) {
         ckind = COND_EMPTYFILE;
         is_is = true;
         s += 16;
-    } else if (strncasecmp(s, "is not", 6) == 0) {
+    } else if (match_word_boundary(s, "is not", 6)) {
         is_is = false;
         s += 6;
     } else if (strncasecmp(s, "returns", 7) == 0 &&
                (s[7] == '\0' || isspace((unsigned char)s[7]))) {
         is_is = true;
         s += 7;
-    } else if (strncasecmp(s, "is", 2) == 0) {
+    } else if (match_word_boundary(s, "is", 2)) {
         is_is = true;
         s += 2;
+        while (*s && isspace((unsigned char)*s)) s++;
+        /* "result is =! 0" */
+        if (strncmp(s, "=!", 2) == 0 || strncmp(s, "!=", 2) == 0) {
+            is_is = false;
+            s += 2;
+        }
     } else if (strncmp(s, "=!", 2) == 0) {
         is_is = false;
         s += 2;
@@ -880,14 +1051,18 @@ if_build:
     stmt->cond.path    = fpath;
     fpath = NULL;
     stmt->cond.is_is   = is_is;
+    stmt->cond.argname = argname;
+    stmt->cond.need_ea = need_ea;
     stmt->cond.values  = values;
     stmt->cond.nvalues  = nvalues;
     stmt->cond.then_branch = NULL;
     stmt->cond.else_branch = NULL;
 
     
+    p->if_depth++;
     stmt->cond.then_branch = parse_stmt_list(p, "else");
     if (p->error) {
+        p->if_depth--;
         stmt_free(stmt);
         return NULL;
     }
@@ -899,10 +1074,12 @@ if_build:
         free(el);
         stmt->cond.else_branch = parse_stmt_list(p, NULL);
         if (p->error) {
+            p->if_depth--;
             stmt_free(stmt);
             return NULL;
         }
     }
+    p->if_depth--;
 
     
     const char *maybe_endif = peek(p);
@@ -933,7 +1110,10 @@ static Stmt *parse_stmt_list(Parser *p, const char *terminator) {
         
         if (line[0] == '}') break;
 
-        
+        /* ztsl26: 'if argument ...' is always a top-level guard of a func, so
+         * it closes any 'if' still open (the draft syntax has no 'endif'). */
+        if (g_ztv == ZTV_ZTSL26 && p->if_depth > 0 && is_arg_guard_line(line)) break;
+
         if (starts_with_kw(line, "endif")) break;
 
         
@@ -973,6 +1153,89 @@ static Stmt *parse_stmt(Parser *p) {
         return parse_if(p);
     }
     
+    if (starts_with_kw(line, "sys.exec.silent")) {
+        if (!require_ztsl26(p, "sys.exec.silent")) return NULL;
+        char *l = consume(p);
+        free(l);
+        bool is_shell;
+        char *code = parse_code_block(p, &is_shell, true);
+        if (!code) return NULL;
+        Stmt *s = xmalloc(sizeof(Stmt));
+        memset(s, 0, sizeof(*s));
+        s->kind = K_EXEC;
+        s->exec.is_shell = is_shell;
+        s->exec.silent = true;
+        s->exec.code = code;
+        return s;
+    }
+
+    if (starts_with_kw(line, "run.func")) {
+        if (!require_ztsl26(p, "run.func")) return NULL;
+        char *l = consume(p);
+        char *cur = skip_ws(l + 8);
+        char *name = take_name(&cur);
+        free(l);
+        if (!name) {
+            parse_error(p, "expected function name after 'run.func'");
+            return NULL;
+        }
+        Stmt *s = xmalloc(sizeof(Stmt));
+        memset(s, 0, sizeof(*s));
+        s->kind = K_RUNFUNC;
+        s->runfunc.name = name;
+        return s;
+    }
+
+    if (starts_with_kw(line, "mem.alloc") || starts_with_kw(line, "mem.free") ||
+        starts_with_kw(line, "mem.write") || starts_with_kw(line, "mem.show")) {
+        StmtKind mk;
+        size_t kwlen;
+        const char *usage;
+        if (starts_with_kw(line, "mem.alloc")) {
+            mk = K_MEMALLOC; kwlen = 9;
+            usage = "usage: mem.alloc \"name\" SIZE";
+        } else if (starts_with_kw(line, "mem.free")) {
+            mk = K_MEMFREE; kwlen = 8;
+            usage = "usage: mem.free \"name\"";
+        } else if (starts_with_kw(line, "mem.write")) {
+            mk = K_MEMWRITE; kwlen = 9;
+            usage = "usage: mem.write \"name\" OFFSET \"text\"";
+        } else {
+            mk = K_MEMSHOW; kwlen = 8;
+            usage = "usage: mem.show \"name\"";
+        }
+        char *l = consume(p);
+        char *cur = skip_ws(l + kwlen);
+        char *mname = take_name(&cur);
+        char *num = NULL, *text = NULL;
+        bool ok = (mname != NULL);
+        if (ok && (mk == K_MEMALLOC || mk == K_MEMWRITE)) {
+            num = take_name(&cur);
+            ok = (num != NULL);
+        }
+        if (ok && mk == K_MEMWRITE) {
+            const char *endp = NULL;
+            text = extract_quoted(cur, &endp);
+            ok = (text != NULL);
+        }
+        free(l);
+        if (!ok) {
+            zt_error("%s", usage);
+            parse_error(p, "bad mem statement");
+            free(mname);
+            free(num);
+            free(text);
+            return NULL;
+        }
+        Stmt *s = xmalloc(sizeof(Stmt));
+        memset(s, 0, sizeof(*s));
+        s->kind = mk;
+        s->mem.name = mname;
+        s->mem.num  = num;
+        s->mem.text = text;
+        return s;
+    }
+
     if (starts_with_kw(line, "sys.exec")) {
         char *l = consume(p);
         free(l);
@@ -1356,6 +1619,19 @@ static void parse_program(Parser *p, Program *prog) {
         } else if (starts_with_kw(l, "zstl.end")) {
             zt_warn("typo 'zstl.end'; did you mean 'ztsl.end'?");
         }
+        if (starts_with_kw(l, "def_mod")) {
+            if (!require_ztsl26(p, "def_mod")) return;
+            char *dl = consume(p);
+            char *cur = skip_ws(dl + 7);
+            char *mname = take_name(&cur);
+            free(dl);
+            if (!mname) {
+                parse_error(p, "expected module name after 'def_mod'");
+                return;
+            }
+            prog_add_mod(prog, mname);
+            continue;
+        }
         if (starts_with_kw(l, "ztsl.start") || starts_with_kw(l, "zstl.start")) {
             parse_ztsl_block(p, prog);
             if (p->error) return;
@@ -1442,14 +1718,286 @@ static char *subst_vars(const char *s, Var *vars) {
     return out.data;
 }
 
+/* A named block of manual memory used by mem.alloc / mem.free / mem.write /
+ * mem.show in interpreted runs. */
+typedef struct {
+    char          *name;
+    unsigned char *data;
+    size_t         size;
+    bool           live;
+    unsigned long  seq;
+} MemH;
+
 typedef struct {
     Program *prog;
-    Var    **vars;       
+    Var    **vars;
     bool     verbose;
-    bool     dry_run;    
-    bool     force;      
-    dstring  gen_c;      
+    bool     dry_run;        /* true: generate C instead of executing */
+    bool     force;
+    dstring  gen_c;
+    /* program arguments (ztsl26): %a% = args[0], %ea% = args[1] */
+    char   **args;
+    int      nargs;
+    bool     handled;        /* some 'if argument ...' already matched */
+    int      depth;          /* run.func nesting */
+    /* interpreted manual memory */
+    MemH    *mem;
+    size_t   nmem;
+    unsigned long seq;
+    /* transpile: handle names -> zt_h[] indexes */
+    char   **hnames;
+    size_t   nhnames;
 } ExecCtx;
+
+/* ---- memchk failure path (shared by the interpreter) ----
+ * "E: Value Out of Bounds (2147483649)" is INT32_MAX + 2, i.e. the result of
+ * pushing an int32 calculation past its range, followed by a segfault. */
+__attribute__((noreturn)) static void zt_memchk_abort(void) {
+    volatile long long edge = 2147483648LL;   /* INT32_MAX + 1 */
+    long long r = edge + 1;
+    fflush(stdout);
+    fprintf(stderr, "E: Value Out of Bounds (%lld)\n", r);
+    fflush(stderr);
+    signal(SIGSEGV, SIG_DFL);
+    raise(SIGSEGV);
+    _exit(139);
+}
+
+/* A memory violation: with -libmemchk it aborts as above; without it, the
+ * interpreter still refuses to touch memory it should not (plain error). */
+static int mem_violation(const char *what, const char *name) {
+    if (g_memchk) zt_memchk_abort();
+    zt_error("%s: %s", what, name);
+    return 1;
+}
+
+static MemH *mem_find(ExecCtx *ctx, const char *name) {
+    for (size_t i = 0; i < ctx->nmem; i++)
+        if (strcmp(ctx->mem[i].name, name) == 0) return &ctx->mem[i];
+    return NULL;
+}
+
+static bool parse_size(const char *s, size_t *out) {
+    while (*s && isspace((unsigned char)*s)) s++;
+    if (*s == '\0' || *s == '-') return false;
+    char *e = NULL;
+    errno = 0;
+    unsigned long long v = strtoull(s, &e, 0);
+    if (errno != 0 || e == s || *e != '\0') return false;
+    *out = (size_t)v;
+    return true;
+}
+
+static char *unescape_dup(const char *s) {
+    dstring o;
+    dstr_init(&o);
+    for (; *s; s++) {
+        if (*s == '\\' && s[1]) {
+            s++;
+            switch (*s) {
+                case 'n':  dstr_append_char(&o, '\n'); break;
+                case 't':  dstr_append_char(&o, '\t'); break;
+                case 'r':  dstr_append_char(&o, '\r'); break;
+                case '\\': dstr_append_char(&o, '\\'); break;
+                case '"':  dstr_append_char(&o, '"');  break;
+                default:   dstr_append_char(&o, '\\'); dstr_append_char(&o, *s); break;
+            }
+        } else {
+            dstr_append_char(&o, *s);
+        }
+    }
+    return o.data;
+}
+
+static int mem_do_alloc(ExecCtx *ctx, const char *name, const char *num) {
+    size_t n;
+    if (!parse_size(num, &n)) {
+        zt_error("mem.alloc %s: invalid size '%s'", name, num);
+        return 1;
+    }
+    MemH *h = mem_find(ctx, name);
+    if (h && h->live) return mem_violation("memory leak (handle reallocated while live)", name);
+    if (!h) {
+        ctx->mem = xrealloc(ctx->mem, sizeof(MemH) * (ctx->nmem + 1));
+        h = &ctx->mem[ctx->nmem++];
+        memset(h, 0, sizeof(*h));
+        h->name = xstrdup(name);
+    }
+    h->data = calloc(n ? n : 1, 1);
+    if (!h->data) {
+        zt_error("mem.alloc %s: out of memory (%zu bytes)", name, n);
+        return 1;
+    }
+    h->size = n;
+    h->live = true;
+    h->seq  = ++ctx->seq;
+    return 0;
+}
+
+static int mem_do_free(ExecCtx *ctx, const char *name) {
+    MemH *h = mem_find(ctx, name);
+    if (!h) { zt_error("mem.free: unknown handle '%s'", name); return 1; }
+    if (!h->live) return mem_violation("double free", name);
+    free(h->data);
+    h->data = NULL;
+    h->live = false;
+    return 0;
+}
+
+static int mem_do_write(ExecCtx *ctx, const char *name, const char *off_s, const char *text) {
+    MemH *h = mem_find(ctx, name);
+    if (!h) { zt_error("mem.write: unknown handle '%s'", name); return 1; }
+    if (!h->live) return mem_violation("use after free", name);
+    size_t off;
+    if (!parse_size(off_s, &off)) {
+        zt_error("mem.write %s: invalid offset '%s'", name, off_s);
+        return 1;
+    }
+    size_t len = strlen(text);
+    if (off > h->size || len + 1 > h->size - off)
+        return mem_violation("buffer overflow", name);
+    memcpy(h->data + off, text, len + 1);
+    return 0;
+}
+
+static int mem_do_show(ExecCtx *ctx, const char *name) {
+    MemH *h = mem_find(ctx, name);
+    if (!h) { zt_error("mem.show: unknown handle '%s'", name); return 1; }
+    if (!h->live) return mem_violation("use after free", name);
+    if (h->size == 0 || !memchr(h->data, '\0', h->size))
+        return mem_violation("buffer overflow (read past end)", name);
+    fputs((const char *)h->data, stdout);
+    fflush(stdout);
+    return 0;
+}
+
+/* Any block allocated after sequence number 'start' that is still live is a leak. */
+static int mem_leak_since(ExecCtx *ctx, unsigned long start) {
+    for (size_t i = 0; i < ctx->nmem; i++)
+        if (ctx->mem[i].live && ctx->mem[i].seq > start)
+            return mem_violation("memory leak", ctx->mem[i].name);
+    return 0;
+}
+
+static void mem_free_all(ExecCtx *ctx) {
+    for (size_t i = 0; i < ctx->nmem; i++) {
+        free(ctx->mem[i].name);
+        free(ctx->mem[i].data);
+    }
+    free(ctx->mem);
+    ctx->mem = NULL;
+    ctx->nmem = 0;
+}
+
+/* ---- %a% / %ea% expansion (ztsl26) ----
+ * %a% is the first program argument, %ea% the one after it. With quote=true
+ * the values are single-quoted so they cannot inject shell syntax. */
+static char *expand_args(char **args, int nargs, const char *tmpl, bool quote) {
+    dstring out;
+    dstr_init(&out);
+    for (const char *p = tmpl; *p; ) {
+        const char *val = NULL;
+        size_t adv = 0;
+        if (strncmp(p, "%ea%", 4) == 0) { val = nargs > 1 ? args[1] : ""; adv = 4; }
+        else if (strncmp(p, "%a%", 3) == 0) { val = nargs > 0 ? args[0] : ""; adv = 3; }
+        if (!val) { dstr_append_char(&out, *p++); continue; }
+        p += adv;
+        if (!quote) { dstr_append_cstr(&out, val); continue; }
+        dstr_append_char(&out, '\'');
+        for (; *val; val++) {
+            if (*val == '\'') dstr_append_cstr(&out, "'\\''");
+            else dstr_append_char(&out, *val);
+        }
+        dstr_append_char(&out, '\'');
+    }
+    return out.data;
+}
+
+/* ---- program structure queries (ztsl26) ---- */
+static Func *find_func(Program *prog, const char *name) {
+    for (Func *f = prog->funcs; f; f = f->next)
+        if (strcmp(f->name, name) == 0) return f;
+    return NULL;
+}
+
+static bool stmts_define_arg(Stmt *s, const char *name) {
+    for (; s; s = s->next) {
+        if (s->kind != K_IF) continue;
+        if (s->cond.kind == COND_ARG_PASSED && strcmp(s->cond.argname, name) == 0) return true;
+        if (stmts_define_arg(s->cond.then_branch, name)) return true;
+        if (stmts_define_arg(s->cond.else_branch, name)) return true;
+    }
+    return false;
+}
+
+static bool prog_arg_defined(Program *prog, const char *name) {
+    for (Func *f = prog->funcs; f; f = f->next)
+        if (stmts_define_arg(f->body, name)) return true;
+    return false;
+}
+
+static void stmts_collect_args(Stmt *s, char ***names, size_t *nn) {
+    for (; s; s = s->next) {
+        if (s->kind != K_IF) continue;
+        if (s->cond.kind == COND_ARG_PASSED) {
+            bool dup = false;
+            for (size_t i = 0; i < *nn; i++)
+                if (strcmp((*names)[i], s->cond.argname) == 0) dup = true;
+            if (!dup) {
+                *names = xrealloc(*names, sizeof(char *) * (*nn + 1));
+                (*names)[(*nn)++] = s->cond.argname;
+            }
+        }
+        stmts_collect_args(s->cond.then_branch, names, nn);
+        stmts_collect_args(s->cond.else_branch, names, nn);
+    }
+}
+
+static bool stmts_run_func(Stmt *s, const char *name) {
+    for (; s; s = s->next) {
+        if (s->kind == K_RUNFUNC && strcmp(s->runfunc.name, name) == 0) return true;
+        if (s->kind == K_IF) {
+            if (stmts_run_func(s->cond.then_branch, name)) return true;
+            if (stmts_run_func(s->cond.else_branch, name)) return true;
+        }
+    }
+    return false;
+}
+
+static bool prog_runs_func(Program *prog, const char *name) {
+    for (Func *f = prog->funcs; f; f = f->next)
+        if (stmts_run_func(f->body, name)) return true;
+    return false;
+}
+
+static bool func_starts_with_guard(Func *fn) {
+    return fn->body && fn->body->kind == K_IF &&
+           (fn->body->cond.kind == COND_ARG_PASSED ||
+            fn->body->cond.kind == COND_ARG_UNDEF);
+}
+
+/* ztsl26 entry points: a func starting with an 'if argument' guard, or any func
+ * nobody reaches through run.func. The rest (e.g. 'help') only run when called. */
+static bool func_is_entry(Program *prog, Func *fn) {
+    return func_starts_with_guard(fn) || !prog_runs_func(prog, fn->name);
+}
+
+static bool eval_arg_cond(ExecCtx *ctx, Cond *c, int *usage_rc) {
+    if (c->kind == COND_ARG_UNDEF) {
+        bool undef = !ctx->handled &&
+                     (ctx->nargs < 1 || !prog_arg_defined(ctx->prog, ctx->args[0]));
+        if (undef) ctx->handled = true;
+        return undef;
+    }
+    if (ctx->nargs < 1 || strcmp(ctx->args[0], c->argname) != 0) return false;
+    ctx->handled = true;
+    if (c->need_ea && ctx->nargs < 2) {
+        zt_error("command '%s' requires an argument", c->argname);
+        *usage_rc = 2;
+        return false;
+    }
+    return true;
+}
 
 static bool path_is_empty_file(const char *path) {
     struct stat st;
@@ -1657,6 +2205,51 @@ static int run_shell(const char *cmd) {
     return rc;
 }
 
+static int run_exec_argv(char **argv, bool silent) {
+    if (!argv || !argv[0]) {
+        zt_error("empty exec command");
+        return -1;
+    }
+
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0) {
+        zt_error("fork() failed: %s", strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {
+        if (silent) {
+            int fd = open("/dev/null", O_WRONLY);
+            if (fd >= 0) {
+                dup2(fd, STDOUT_FILENO);
+                dup2(fd, STDERR_FILENO);
+                close(fd);
+            }
+        }
+        execvp(argv[0], argv);
+        fprintf(stderr, "E: execvp(%s) failed: %s\n",
+                argv[0], strerror(errno));
+        _exit(127);
+    }
+
+    int status = 0;
+    pid_t w;
+    do {
+        w = waitpid(pid, &status, 0);
+    } while (w < 0 && errno == EINTR);
+
+    if (w < 0) {
+        zt_error("waitpid() failed: %s", strerror(errno));
+        return -1;
+    }
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) {
+        zt_error("%s terminated by signal %d", argv[0], WTERMSIG(status));
+        return 128 + WTERMSIG(status);
+    }
+    return 0;
+}
+
 static int run_exec(const char *cmd) {
     int argc = 0;
     char **argv = split_args(cmd, &argc);
@@ -1665,50 +2258,47 @@ static int run_exec(const char *cmd) {
         free_args(argv);
         return -1;
     }
+    int rc = run_exec_argv(argv, false);
+    free_args(argv);
+    return rc;
+}
 
-    
-    char *prog_name = xstrdup(argv[0]);
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        zt_error("fork() failed: %s", strerror(errno));
-        free(prog_name);
+/* ztsl26 command runner. exec: %a%/%ea% are expanded per argument AFTER the
+ * line is split, so a value with spaces stays one argument. shell: values are
+ * single-quoted. silent: stdout/stderr go to /dev/null. */
+static int run_cmd26(ExecCtx *ctx, const char *code, bool is_shell, bool silent) {
+    int rc;
+    if (is_shell) {
+        char *cmd = expand_args(ctx->args, ctx->nargs, code, true);
+        if (silent) {
+            dstring full;
+            dstr_init(&full);
+            dstr_append_cstr(&full, "( ");
+            dstr_append_cstr(&full, cmd);
+            dstr_append_cstr(&full, "\n) >/dev/null 2>&1");
+            rc = run_shell(full.data);
+            dstr_free(&full);
+        } else {
+            rc = run_shell(cmd);
+        }
+        free(cmd);
+        return rc;
+    }
+    int argc = 0;
+    char **argv = split_args(code, &argc);
+    if (argc == 0 || !argv) {
+        zt_error("empty exec command");
         free_args(argv);
         return -1;
     }
-    if (pid == 0) {
-        
-        execvp(argv[0], argv);
-        
-        fprintf(stderr, "E: execvp(%s) failed: %s\n",
-                argv[0], strerror(errno));
-        _exit(127);
+    for (int i = 0; i < argc; i++) {
+        char *e = expand_args(ctx->args, ctx->nargs, argv[i], false);
+        free(argv[i]);
+        argv[i] = e;
     }
-    
-    int status = 0;
-    pid_t w;
-    do {
-        w = waitpid(pid, &status, 0);
-    } while (w < 0 && errno == EINTR);
-
+    rc = run_exec_argv(argv, silent);
     free_args(argv);
-    if (w < 0) {
-        zt_error("waitpid() failed: %s", strerror(errno));
-        free(prog_name);
-        return -1;
-    }
-    if (WIFEXITED(status)) {
-        free(prog_name);
-        return WEXITSTATUS(status);
-    }
-    if (WIFSIGNALED(status)) {
-        zt_error("%s terminated by signal %d",
-                prog_name, WTERMSIG(status));
-        free(prog_name);
-        return 128 + WTERMSIG(status);
-    }
-    free(prog_name);
-    return 0;
+    return rc;
 }
 
 static void c_escape_append(dstring *out, const char *s) {
@@ -1745,6 +2335,176 @@ static int exec_stmt_list(ExecCtx *ctx, Stmt *list) {
     return 0;
 }
 
+/* Conditions that can only be decided when the compiled program runs
+ * (arguments, last command result). The rest are folded at transpile time. */
+static bool cond_is_runtime(const Cond *c) {
+    if (c->kind == COND_ARG_PASSED || c->kind == COND_ARG_UNDEF) return true;
+    return g_ztv == ZTV_ZTSL26 && c->kind == COND_EQ && c->subj == SUBJ_VAR &&
+           c->var && strcasecmp(c->var, "result") == 0;
+}
+
+static int hindex(ExecCtx *ctx, const char *name) {
+    for (size_t i = 0; i < ctx->nhnames; i++)
+        if (strcmp(ctx->hnames[i], name) == 0) return (int)i;
+    ctx->hnames = xrealloc(ctx->hnames, sizeof(char *) * (ctx->nhnames + 1));
+    ctx->hnames[ctx->nhnames] = xstrdup(name);
+    return (int)ctx->nhnames++;
+}
+
+static int func_index(Program *prog, const char *name) {
+    int i = 0;
+    for (Func *f = prog->funcs; f; f = f->next, i++)
+        if (strcmp(f->name, name) == 0) return i;
+    return -1;
+}
+
+static int gen_exec26(ExecCtx *ctx, const char *code, bool is_shell, bool silent) {
+    dstring *g = &ctx->gen_c;
+    if (is_shell) {
+        dstr_append_cstr(g, "    zt_result = zt_run_shell(");
+        c_escape_append(g, code);
+        dstr_appendf(g, ", %d);\n", silent ? 1 : 0);
+    } else {
+        int argc = 0;
+        char **argv = split_args(code, &argc);
+        if (argc == 0 || !argv) {
+            zt_error("empty exec command");
+            free_args(argv);
+            return 1;
+        }
+        dstr_append_cstr(g, "    { const char *za[] = {");
+        for (int i = 0; i < argc; i++) {
+            c_escape_append(g, argv[i]);
+            dstr_append_cstr(g, ", ");
+        }
+        dstr_appendf(g, "NULL}; zt_result = zt_run_exec(za, %d); }\n", silent ? 1 : 0);
+        free_args(argv);
+    }
+    if (!silent) dstr_append_cstr(g, "    if (zt_result != 0) return 1;\n");
+    return 0;
+}
+
+/* if argument ... / if result ... : emitted as a real C if/else. Note that
+ * 'define' inside such a branch still takes effect at transpile time. */
+static int gen_runtime_if(ExecCtx *ctx, Stmt *s) {
+    Cond *c = &s->cond;
+    dstring *g = &ctx->gen_c;
+    dstr_append_cstr(g, "    {\n");
+    if (c->kind == COND_ARG_PASSED) {
+        dstr_append_cstr(g, "    int zc = zt_arg_passed(");
+        c_escape_append(g, c->argname);
+        dstr_appendf(g, ", %d);\n    if (zt_usage_err) return 2;\n", c->need_ea ? 1 : 0);
+    } else if (c->kind == COND_ARG_UNDEF) {
+        dstr_append_cstr(g, "    int zc = zt_arg_undef();\n");
+    } else {
+        dstr_append_cstr(g, "    int zc = ");
+        dstr_append_cstr(g, c->is_is ? "(" : "!(");
+        if (c->nvalues == 0) dstr_append_cstr(g, "0");
+        for (size_t i = 0; i < c->nvalues; i++) {
+            char *sv = subst_vars(c->values[i], *ctx->vars);
+            if (i) dstr_append_cstr(g, " || ");
+            dstr_append_cstr(g, "zt_res_eq(");
+            c_escape_append(g, sv);
+            dstr_append_cstr(g, ")");
+            free(sv);
+        }
+        dstr_append_cstr(g, ");\n");
+    }
+    dstr_append_cstr(g, "    if (zc) {\n");
+    int rc = exec_stmt_list(ctx, c->then_branch);
+    if (rc == 0) {
+        dstr_append_cstr(g, "    } else {\n");
+        rc = exec_stmt_list(ctx, c->else_branch);
+    }
+    dstr_append_cstr(g, "    }\n    }\n");
+    return rc;
+}
+
+/* mem.* in generated C. Without memchk this is plain manual memory (malloc /
+ * free / memcpy, no checks). With memchk, malloc/free are the guarded ones and
+ * mem.write also checks its bounds explicitly. */
+static int gen_mem(ExecCtx *ctx, StmtKind k, const char *name, const char *num,
+                   const char *text) {
+    dstring *g = &ctx->gen_c;
+    int h = hindex(ctx, name);
+    switch (k) {
+        case K_MEMALLOC: {
+            size_t n;
+            if (!parse_size(num, &n)) {
+                zt_error("mem.alloc %s: invalid size '%s'", name, num);
+                return 1;
+            }
+            dstr_appendf(g, "    zt_h[%d] = (char *)malloc(%zu);\n"
+                            "    zt_hn[%d] = %zu;\n"
+                            "    if (!zt_h[%d]) return 1;\n", h, n, h, n, h);
+            break;
+        }
+        case K_MEMFREE:
+            dstr_appendf(g, "    if (!zt_h[%d]) { fputs(\"E: mem.free: handle '%s' was never allocated\\n\", stderr); return 1; }\n", h, name);
+            dstr_appendf(g, "    free(zt_h[%d]);\n", h);
+            break;
+        case K_MEMWRITE: {
+            size_t off;
+            if (!parse_size(num, &off)) {
+                zt_error("mem.write %s: invalid offset '%s'", name, num);
+                return 1;
+            }
+            size_t len = strlen(text);
+            dstr_appendf(g, "    if (!zt_h[%d]) { fputs(\"E: mem.write: handle '%s' was never allocated\\n\", stderr); return 1; }\n", h, name);
+            dstr_append_cstr(g, "    { const char *zs = ");
+            c_escape_append(g, text);
+            dstr_append_cstr(g, ";\n");
+            if (g_memchk) {
+                size_t total = off + len + 1;   /* bytes that must fit, text + NUL */
+                if (total < off) {
+                    zt_error("mem.write %s: offset too large", name);
+                    return 1;
+                }
+                dstr_appendf(g, "      if (zt_hn[%d] < %zu) ztm_abort();\n", h, total);
+            }
+            dstr_appendf(g, "      memcpy(zt_h[%d] + %zu, zs, %zu); }\n", h, off, len + 1);
+            break;
+        }
+        case K_MEMSHOW:
+            dstr_appendf(g, "    if (!zt_h[%d]) { fputs(\"E: mem.show: handle '%s' was never allocated\\n\", stderr); return 1; }\n", h, name);
+            dstr_appendf(g, "    { const char *zp = zt_h[%d]; for (size_t zk = 0; zp[zk]; zk++) putchar(zp[zk]); fflush(stdout); }\n", h);
+            break;
+        default:
+            break;
+    }
+    return 0;
+}
+
+static int run_mem(ExecCtx *ctx, StmtKind k, const char *name, const char *num,
+                   const char *text) {
+    if (ctx->verbose)
+        fprintf(stderr, "[mem] %s\n", name);
+    switch (k) {
+        case K_MEMALLOC: return mem_do_alloc(ctx, name, num);
+        case K_MEMFREE:  return mem_do_free(ctx, name);
+        case K_MEMWRITE: return mem_do_write(ctx, name, num, text);
+        case K_MEMSHOW:  return mem_do_show(ctx, name);
+        default:         return 0;
+    }
+}
+
+static int exec_mem(ExecCtx *ctx, Stmt *s) {
+    char *name = subst_vars(s->mem.name, *ctx->vars);
+    char *num  = s->mem.num ? subst_vars(s->mem.num, *ctx->vars) : NULL;
+    char *text = NULL;
+    if (s->mem.text) {
+        char *t = subst_vars(s->mem.text, *ctx->vars);
+        text = unescape_dup(t);
+        free(t);
+    }
+    int rc = ctx->dry_run ? gen_mem(ctx, s->kind, name, num, text)
+                          : run_mem(ctx, s->kind, name, num, text);
+    free(name);
+    free(num);
+    free(text);
+    return rc;
+}
+
 static int exec_stmt(ExecCtx *ctx, Stmt *s) {
     switch (s->kind) {
         case K_DEFINE: {
@@ -1756,20 +2516,38 @@ static int exec_stmt(ExecCtx *ctx, Stmt *s) {
             return 0;
         }
         case K_IF: {
-            bool ok = eval_cond(&s->cond, *ctx->vars);
+            if (ctx->dry_run && cond_is_runtime(&s->cond))
+                return gen_runtime_if(ctx, s);
+            bool ok;
+            if (s->cond.kind == COND_ARG_PASSED || s->cond.kind == COND_ARG_UNDEF) {
+                int usage_rc = 0;
+                ok = eval_arg_cond(ctx, &s->cond, &usage_rc);
+                if (usage_rc != 0) return usage_rc;
+            } else {
+                ok = eval_cond(&s->cond, *ctx->vars);
+            }
             if (ctx->verbose) {
-                const char *subj_desc = (s->cond.subj == SUBJ_READFILE)
-                    ? s->cond.path : s->cond.var;
-                const char *subj_label = (s->cond.subj == SUBJ_READFILE)
-                    ? "read_file " : "";
-                if (s->cond.kind == COND_EMPTYFILE) {
-                    fprintf(stderr, "[if] %s%s %s an empty file -> %s\n",
-                            subj_label, subj_desc, s->cond.is_is ? "is" : "is not",
+                if (s->cond.kind == COND_ARG_PASSED) {
+                    fprintf(stderr, "[if] argument %s is passed%s -> %s\n",
+                            s->cond.argname, s->cond.need_ea ? " with %ea%" : "",
+                            ok ? "true" : "false");
+                } else if (s->cond.kind == COND_ARG_UNDEF) {
+                    fprintf(stderr, "[if] argument is not defined -> %s\n",
                             ok ? "true" : "false");
                 } else {
-                    fprintf(stderr, "[if] %s%s %s -> %s\n",
-                            subj_label, subj_desc, s->cond.is_is ? "is" : "is not",
-                            ok ? "true" : "false");
+                    const char *subj_desc = (s->cond.subj == SUBJ_READFILE)
+                        ? s->cond.path : s->cond.var;
+                    const char *subj_label = (s->cond.subj == SUBJ_READFILE)
+                        ? "read_file " : "";
+                    if (s->cond.kind == COND_EMPTYFILE) {
+                        fprintf(stderr, "[if] %s%s %s an empty file -> %s\n",
+                                subj_label, subj_desc, s->cond.is_is ? "is" : "is not",
+                                ok ? "true" : "false");
+                    } else {
+                        fprintf(stderr, "[if] %s%s %s -> %s\n",
+                                subj_label, subj_desc, s->cond.is_is ? "is" : "is not",
+                                ok ? "true" : "false");
+                    }
                 }
             }
             return exec_stmt_list(ctx, ok ? s->cond.then_branch
@@ -1778,8 +2556,10 @@ static int exec_stmt(ExecCtx *ctx, Stmt *s) {
         case K_EXEC: {
             char *code = subst_vars(s->exec.code, *ctx->vars);
             if (ctx->dry_run) {
-                
-                if (s->exec.is_shell) {
+                int grc = 0;
+                if (g_ztv == ZTV_ZTSL26) {
+                    grc = gen_exec26(ctx, code, s->exec.is_shell, s->exec.silent);
+                } else if (s->exec.is_shell) {
                     dstr_append_cstr(&ctx->gen_c, "    if (system(");
                     c_escape_append(&ctx->gen_c, code);
                     dstr_append_cstr(&ctx->gen_c, ") != 0) return 1;\n");
@@ -1789,24 +2569,45 @@ static int exec_stmt(ExecCtx *ctx, Stmt *s) {
                     dstr_append_cstr(&ctx->gen_c, ") != 0) return 1;\n");
                 }
                 free(code);
-                return 0;
+                return grc;
             }
             if (ctx->verbose) {
-                fprintf(stderr, "[%s] %s\n",
-                        s->exec.is_shell ? "shell" : "exec", code);
+                fprintf(stderr, "[%s%s] %s\n",
+                        s->exec.is_shell ? "shell" : "exec",
+                        s->exec.silent ? ".silent" : "", code);
             }
             int rc;
-            if (s->exec.is_shell) rc = run_shell(code);
-            else                  rc = run_exec(code);
+            if (g_ztv == ZTV_ZTSL26) {
+                rc = run_cmd26(ctx, code, s->exec.is_shell, s->exec.silent);
+                char rbuf[16];
+                snprintf(rbuf, sizeof(rbuf), "%d", rc);
+                var_set(ctx->vars, "result", rbuf);
+                if (s->exec.silent) rc = 0;   /* the program checks 'result' itself */
+            } else if (s->exec.is_shell) {
+                rc = run_shell(code);
+            } else {
+                rc = run_exec(code);
+            }
             free(code);
             return rc;
         }
         case K_SHOW: {
             char *code = subst_vars(s->show.code, *ctx->vars);
             if (ctx->dry_run) {
-                dstr_append_cstr(&ctx->gen_c, "    fputs(");
-                c_escape_append(&ctx->gen_c, code);
-                dstr_append_cstr(&ctx->gen_c, ", stdout);\n");
+                if (g_ztv == ZTV_ZTSL26) {
+                    dstr_append_cstr(&ctx->gen_c, "    zt_show(");
+                    c_escape_append(&ctx->gen_c, code);
+                    dstr_append_cstr(&ctx->gen_c, ");\n");
+                } else {
+                    dstr_append_cstr(&ctx->gen_c, "    fputs(");
+                    c_escape_append(&ctx->gen_c, code);
+                    dstr_append_cstr(&ctx->gen_c, ", stdout); fflush(stdout);\n");
+                }
+            } else if (g_ztv == ZTV_ZTSL26) {
+                char *e = expand_args(ctx->args, ctx->nargs, code, false);
+                fputs(e, stdout);
+                fflush(stdout);
+                free(e);
             } else {
                 fputs(code, stdout);
                 fflush(stdout);
@@ -1924,6 +2725,37 @@ static int exec_stmt(ExecCtx *ctx, Stmt *s) {
             free(result);
             return 0;
         }
+        case K_RUNFUNC: {
+            if (ctx->dry_run) {
+                int fi = func_index(ctx->prog, s->runfunc.name);
+                if (fi < 0) {
+                    zt_error("run.func: no such function: %s", s->runfunc.name);
+                    return 1;
+                }
+                dstr_appendf(&ctx->gen_c,
+                    "    { int zr = zf_%d(); ZTM_CHK(); if (zr != 0) return zr; }\n", fi);
+                return 0;
+            }
+            Func *fn = find_func(ctx->prog, s->runfunc.name);
+            if (!fn) {
+                zt_error("run.func: no such function: %s", s->runfunc.name);
+                return 1;
+            }
+            if (ctx->depth >= 64) {
+                zt_error("run.func %s: recursion too deep", s->runfunc.name);
+                return 1;
+            }
+            if (ctx->verbose) fprintf(stderr, "[run.func] %s\n", fn->name);
+            ctx->depth++;
+            int rc = exec_stmt_list(ctx, fn->body);
+            ctx->depth--;
+            return rc;
+        }
+        case K_MEMALLOC:
+        case K_MEMFREE:
+        case K_MEMWRITE:
+        case K_MEMSHOW:
+            return exec_mem(ctx, s);
     }
     return 0;
 }
@@ -1954,7 +2786,15 @@ static void serialize_stmt(dstring *out, Stmt *s) {
                 dstr_append_cstr(out, "READFILE ");
                 dstr_append_cstr(out, s->cond.path);
             } else {
-                dstr_append_cstr(out, s->cond.var);
+                if (s->cond.kind == COND_ARG_PASSED) {
+                    dstr_append_cstr(out, "ARG ");
+                    dstr_append_cstr(out, s->cond.argname);
+                    dstr_append_cstr(out, s->cond.need_ea ? " WITHEA" : "");
+                } else if (s->cond.kind == COND_ARG_UNDEF) {
+                    dstr_append_cstr(out, "ARGUNDEF");
+                } else {
+                    dstr_append_cstr(out, s->cond.var);
+                }
             }
             if (s->cond.kind == COND_EMPTYFILE) {
                 dstr_append_cstr(out, s->cond.is_is ? " ISEMPTYFILE" : " ISNOTEMPTYFILE");
@@ -1975,7 +2815,7 @@ static void serialize_stmt(dstring *out, Stmt *s) {
             dstr_append_cstr(out, "ENDIF\n");
             break;
         case K_EXEC:
-            dstr_append_cstr(out, "EXEC ");
+            dstr_append_cstr(out, s->exec.silent ? "EXECSILENT " : "EXEC ");
             dstr_append_cstr(out, s->exec.is_shell ? "SHELL\n" : "EXECP\n");
             dstr_append_cstr(out, s->exec.code);
             dstr_append_char(out, '\n');
@@ -2024,6 +2864,18 @@ static void serialize_stmt(dstring *out, Stmt *s) {
             dstr_append_char(out, '\n');
             break;
         }
+        case K_RUNFUNC:
+            dstr_append_cstr(out, "RUNFUNC ");
+            dstr_append_cstr(out, s->runfunc.name);
+            dstr_append_char(out, '\n');
+            break;
+        case K_MEMALLOC:
+        case K_MEMFREE:
+        case K_MEMWRITE:
+        case K_MEMSHOW:
+            dstr_appendf(out, "MEM%d %s %s %s\n", (int)s->kind, s->mem.name,
+                         s->mem.num ? s->mem.num : "", s->mem.text ? s->mem.text : "");
+            break;
     }
 }
 
@@ -2128,12 +2980,320 @@ static void write_stored_hash(const char *hashdir, const char *name,
     fclose(f);
 }
 
-static int transpile_to_c(ExecCtx *ctx, const char *out_path) {
-    
+static const char *const ZTM_RT_SRC[] = {
+    "/* ---- ztc libmemchk runtime (built into ztc, enabled with -libmemchk) ----\n",
+    " * Every allocation gets its own mapping with a PROT_NONE guard page on each\n",
+    " * side. The block ends right at the upper guard page, so an overflow faults\n",
+    " * immediately; freed blocks are kept mapped as PROT_NONE, so a use-after-free\n",
+    " * or a double free is caught. Leaks are checked at scope end / program end. */\n",
+    "typedef struct ztm_blk {\n",
+    "    char *base;\n",
+    "    size_t maplen;\n",
+    "    char *user;\n",
+    "    size_t size;\n",
+    "    size_t rn;\n",
+    "    unsigned long seq;\n",
+    "    int freed;\n",
+    "    struct ztm_blk *next;\n",
+    "} ztm_blk;\n",
+    "\n",
+    "static ztm_blk *ztm_head;\n",
+    "static unsigned long ztm_seq;\n",
+    "\n",
+    "static size_t ztm_pg(void) {\n",
+    "    static size_t pg;\n",
+    "    if (!pg) pg = (size_t)sysconf(_SC_PAGESIZE);\n",
+    "    return pg;\n",
+    "}\n",
+    "\n",
+    "__attribute__((noreturn)) static void ztm_abort(void) {\n",
+    "    volatile long long edge = 2147483648LL; /* INT32_MAX + 1 */\n",
+    "    long long r = edge + 1;\n",
+    "    char buf[80];\n",
+    "    size_t n = 0;\n",
+    "    const char *pre = \"E: Value Out of Bounds (\";\n",
+    "    char dig[24];\n",
+    "    int d = 0;\n",
+    "    unsigned long long u = (unsigned long long)r;\n",
+    "    ssize_t wr;\n",
+    "    while (*pre) buf[n++] = *pre++;\n",
+    "    do { dig[d++] = (char)('0' + u % 10); u /= 10; } while (u);\n",
+    "    while (d) buf[n++] = dig[--d];\n",
+    "    buf[n++] = ')';\n",
+    "    buf[n++] = '\\n';\n",
+    "    fflush(stdout);\n",
+    "    wr = write(2, buf, n);\n",
+    "    (void)wr;\n",
+    "    signal(SIGSEGV, SIG_DFL);\n",
+    "    raise(SIGSEGV);\n",
+    "    _exit(139);\n",
+    "}\n",
+    "\n",
+    "static ztm_blk *ztm_find(const void *p) {\n",
+    "    for (ztm_blk *b = ztm_head; b; b = b->next)\n",
+    "        if (b->user == (const char *)p) return b;\n",
+    "    return NULL;\n",
+    "}\n",
+    "\n",
+    "static int ztm_canary_ok(const ztm_blk *b) {\n",
+    "    for (size_t i = b->size; i < b->rn; i++)\n",
+    "        if ((unsigned char)b->user[i] != 0xA5) return 0;\n",
+    "    return 1;\n",
+    "}\n",
+    "\n",
+    "static void *ztm_malloc(size_t n) {\n",
+    "    size_t pg = ztm_pg();\n",
+    "    if (n > ((size_t)-1) / 4) return NULL;\n",
+    "    size_t dat = ((n ? n : 1) + pg - 1) / pg * pg;\n",
+    "    size_t total = dat + 2 * pg;\n",
+    "    char *base = mmap(NULL, total, PROT_READ | PROT_WRITE,\n",
+    "                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);\n",
+    "    if (base == (char *)MAP_FAILED) return NULL;\n",
+    "    if (mprotect(base, pg, PROT_NONE) != 0 ||\n",
+    "        mprotect(base + pg + dat, pg, PROT_NONE) != 0) {\n",
+    "        munmap(base, total);\n",
+    "        return NULL;\n",
+    "    }\n",
+    "    size_t rn = (n + 15) & ~(size_t)15;\n",
+    "    if (rn == 0) rn = 16;\n",
+    "    char *user = base + pg + dat - rn;\n",
+    "    for (size_t i = n; i < rn; i++) user[i] = (char)0xA5;\n",
+    "    ztm_blk *b = malloc(sizeof *b);\n",
+    "    if (!b) { munmap(base, total); return NULL; }\n",
+    "    b->base = base;\n",
+    "    b->maplen = total;\n",
+    "    b->user = user;\n",
+    "    b->size = n;\n",
+    "    b->rn = rn;\n",
+    "    b->seq = ++ztm_seq;\n",
+    "    b->freed = 0;\n",
+    "    b->next = ztm_head;\n",
+    "    ztm_head = b;\n",
+    "    return user;\n",
+    "}\n",
+    "\n",
+    "static void ztm_free(void *p) {\n",
+    "    if (!p) return;\n",
+    "    ztm_blk *b = ztm_find(p);\n",
+    "    if (!b) ztm_abort();             /* invalid free */\n",
+    "    if (b->freed) ztm_abort();       /* double free */\n",
+    "    if (!ztm_canary_ok(b)) ztm_abort(); /* small overflow into the slack */\n",
+    "    mprotect(b->base + ztm_pg(), b->maplen - 2 * ztm_pg(), PROT_NONE);\n",
+    "    b->freed = 1;\n",
+    "}\n",
+    "\n",
+    "static void *ztm_calloc(size_t nm, size_t sz) {\n",
+    "    if (sz && nm > ((size_t)-1) / sz) return NULL;\n",
+    "    return ztm_malloc(nm * sz); /* fresh anonymous pages are zeroed */\n",
+    "}\n",
+    "\n",
+    "static void *ztm_realloc(void *p, size_t n) {\n",
+    "    if (!p) return ztm_malloc(n);\n",
+    "    ztm_blk *b = ztm_find(p);\n",
+    "    if (!b || b->freed) ztm_abort();\n",
+    "    void *q = ztm_malloc(n);\n",
+    "    if (!q) return NULL;\n",
+    "    memcpy(q, p, b->size < n ? b->size : n);\n",
+    "    ztm_free(p);\n",
+    "    return q;\n",
+    "}\n",
+    "\n",
+    "static char *ztm_strdup(const char *s) {\n",
+    "    size_t l = strlen(s) + 1;\n",
+    "    char *q = ztm_malloc(l);\n",
+    "    if (q) memcpy(q, s, l);\n",
+    "    return q;\n",
+    "}\n",
+    "\n",
+    "static void ztm_segv(int sig, siginfo_t *si, void *uc) {\n",
+    "    (void)sig;\n",
+    "    (void)uc;\n",
+    "    const char *a = (const char *)si->si_addr;\n",
+    "    for (ztm_blk *b = ztm_head; b; b = b->next)\n",
+    "        if (a >= b->base && a < b->base + b->maplen) ztm_abort();\n",
+    "    /* not ours: the handler was installed with SA_RESETHAND, so returning\n",
+    "     * re-runs the fault with the default action */\n",
+    "}\n",
+    "\n",
+    "static void ztm_init(void) {\n",
+    "    struct sigaction sa;\n",
+    "    memset(&sa, 0, sizeof sa);\n",
+    "    sa.sa_sigaction = ztm_segv;\n",
+    "    sa.sa_flags = SA_SIGINFO | SA_RESETHAND | SA_NODEFER;\n",
+    "    sigemptyset(&sa.sa_mask);\n",
+    "    sigaction(SIGSEGV, &sa, NULL);\n",
+    "}\n",
+    "\n",
+    "/* checkpoint (after every run.func): a live block whose slack bytes changed\n",
+    " * was overflowed */\n",
+    "static void ztm_check(void) {\n",
+    "    for (ztm_blk *b = ztm_head; b; b = b->next)\n",
+    "        if (!b->freed && !ztm_canary_ok(b)) ztm_abort();\n",
+    "}\n",
+    "\n",
+    "/* end of a successful run: anything still allocated is a leak */\n",
+    "static void ztm_leaks(void) {\n",
+    "    ztm_check();\n",
+    "    for (ztm_blk *b = ztm_head; b; b = b->next)\n",
+    "        if (!b->freed) ztm_abort();\n",
+    "}\n",
+    NULL
+};
 
-    
+static const char *const ZT26_RT_SRC[] = {
+    "/* ---- ZTSL 26 runtime: program arguments (%a%, %ea%), exec, result ---- */\n",
+    "static int zt_argc;\n",
+    "static char **zt_argv;\n",
+    "static int zt_handled, zt_usage_err, zt_result;\n",
+    "\n",
+    "typedef struct { char *p; size_t n, cap; } zt_buf;\n",
+    "\n",
+    "static void zt_bput(zt_buf *b, const char *s, size_t k) {\n",
+    "    if (b->n + k + 1 > b->cap) {\n",
+    "        size_t nc = b->cap ? b->cap : 64;\n",
+    "        while (nc < b->n + k + 1) nc *= 2;\n",
+    "        char *np = realloc(b->p, nc);\n",
+    "        if (!np) { fputs(\"E: out of memory\\n\", stderr); exit(1); }\n",
+    "        b->p = np;\n",
+    "        b->cap = nc;\n",
+    "    }\n",
+    "    memcpy(b->p + b->n, s, k);\n",
+    "    b->n += k;\n",
+    "    b->p[b->n] = '\\0';\n",
+    "}\n",
+    "\n",
+    "/* %a% = first program argument, %ea% = the one after it.\n",
+    " * quote != 0: values are single-quoted for sh (no shell injection). */\n",
+    "static char *zt_expand(const char *t, int quote) {\n",
+    "    zt_buf b = {NULL, 0, 0};\n",
+    "    zt_bput(&b, \"\", 0);\n",
+    "    while (*t) {\n",
+    "        const char *val = NULL;\n",
+    "        size_t adv = 0;\n",
+    "        if (strncmp(t, \"%ea%\", 4) == 0) { val = zt_argc > 2 ? zt_argv[2] : \"\"; adv = 4; }\n",
+    "        else if (strncmp(t, \"%a%\", 3) == 0) { val = zt_argc > 1 ? zt_argv[1] : \"\"; adv = 3; }\n",
+    "        if (!val) { zt_bput(&b, t, 1); t++; continue; }\n",
+    "        t += adv;\n",
+    "        if (!quote) { zt_bput(&b, val, strlen(val)); continue; }\n",
+    "        zt_bput(&b, \"'\", 1);\n",
+    "        for (; *val; val++) {\n",
+    "            if (*val == '\\'') zt_bput(&b, \"'\\\\''\", 4);\n",
+    "            else zt_bput(&b, val, 1);\n",
+    "        }\n",
+    "        zt_bput(&b, \"'\", 1);\n",
+    "    }\n",
+    "    return b.p;\n",
+    "}\n",
+    "\n",
+    "static void zt_show(const char *t) {\n",
+    "    char *s = zt_expand(t, 0);\n",
+    "    fputs(s, stdout);\n",
+    "    fflush(stdout);\n",
+    "    free(s);\n",
+    "}\n",
+    "\n",
+    "static int zt_status(int st) {\n",
+    "    if (WIFEXITED(st)) return WEXITSTATUS(st);\n",
+    "    if (WIFSIGNALED(st)) return 128 + WTERMSIG(st);\n",
+    "    return 0;\n",
+    "}\n",
+    "\n",
+    "static int zt_run_exec(const char *const *tmpl, int silent) {\n",
+    "    size_t n = 0;\n",
+    "    while (tmpl[n]) n++;\n",
+    "    char **av = calloc(n + 1, sizeof *av);\n",
+    "    if (!av) return -1;\n",
+    "    for (size_t i = 0; i < n; i++) av[i] = zt_expand(tmpl[i], 0);\n",
+    "    fflush(NULL);\n",
+    "    pid_t pid = fork();\n",
+    "    int st = 0, rc;\n",
+    "    if (pid == 0) {\n",
+    "        if (silent) {\n",
+    "            int fd = open(\"/dev/null\", O_WRONLY);\n",
+    "            if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }\n",
+    "        }\n",
+    "        execvp(av[0], av);\n",
+    "        fprintf(stderr, \"E: execvp(%s) failed: %s\\n\", av[0], strerror(errno));\n",
+    "        _exit(127);\n",
+    "    }\n",
+    "    if (pid < 0) {\n",
+    "        rc = -1;\n",
+    "    } else {\n",
+    "        pid_t w;\n",
+    "        do { w = waitpid(pid, &st, 0); } while (w < 0 && errno == EINTR);\n",
+    "        rc = w < 0 ? -1 : zt_status(st);\n",
+    "    }\n",
+    "    for (size_t i = 0; i < n; i++) free(av[i]);\n",
+    "    free(av);\n",
+    "    return rc;\n",
+    "}\n",
+    "\n",
+    "static int zt_run_shell(const char *tmpl, int silent) {\n",
+    "    char *cmd = zt_expand(tmpl, 1);\n",
+    "    zt_buf full = {NULL, 0, 0};\n",
+    "    zt_bput(&full, \"\", 0);\n",
+    "    if (silent) {\n",
+    "        zt_bput(&full, \"( \", 2);\n",
+    "        zt_bput(&full, cmd, strlen(cmd));\n",
+    "        zt_bput(&full, \"\\n) >/dev/null 2>&1\", 18);\n",
+    "    } else {\n",
+    "        zt_bput(&full, cmd, strlen(cmd));\n",
+    "    }\n",
+    "    fflush(NULL);\n",
+    "    int st = system(full.p);\n",
+    "    free(full.p);\n",
+    "    free(cmd);\n",
+    "    return st == -1 ? -1 : zt_status(st);\n",
+    "}\n",
+    "\n",
+    "static int zt_res_eq(const char *v) {\n",
+    "    char b[24];\n",
+    "    snprintf(b, sizeof b, \"%d\", zt_result);\n",
+    "    return strcmp(b, v) == 0;\n",
+    "}\n",
+    "\n",
+    "static int zt_arg_passed(const char *name, int need_ea) {\n",
+    "    if (zt_argc < 2 || strcmp(zt_argv[1], name) != 0) return 0;\n",
+    "    zt_handled = 1;\n",
+    "    if (need_ea && zt_argc < 3) {\n",
+    "        fprintf(stderr, \"E: command '%s' requires an argument\\n\", name);\n",
+    "        zt_usage_err = 1;\n",
+    "        return 0;\n",
+    "    }\n",
+    "    return 1;\n",
+    "}\n",
+    "\n",
+    "static int zt_arg_undef(void) {\n",
+    "    if (zt_handled) return 0;\n",
+    "    if (zt_argc >= 2) {\n",
+    "        for (size_t i = 0; zt_defined[i]; i++)\n",
+    "            if (strcmp(zt_argv[1], zt_defined[i]) == 0) return 0;\n",
+    "    }\n",
+    "    zt_handled = 1;\n",
+    "    return 1;\n",
+    "}\n",
+    NULL
+};
+
+static void append_rt(dstring *d, const char *const *lines) {
+    for (; *lines; lines++) dstr_append_cstr(d, *lines);
+}
+
+#define ZTSL_LIBDIR "/usr/lib/ztsl"
+
+/* def_mod NAME -> /usr/lib/ztsl/NAME-<arch>.so (libs are written in C).
+ * 'libztsl' is the built-in runtime: ztc ignores it and compiles the program. */
+static char *mod_path(const char *name) {
+    struct utsname u;
+    const char *arch = (uname(&u) == 0) ? u.machine : "unknown";
+    size_t n = strlen(ZTSL_LIBDIR) + strlen(name) + strlen(arch) + 8;
+    char *path = xmalloc(n);
+    snprintf(path, n, "%s/%s-%s.so", ZTSL_LIBDIR, name, arch);
+    return path;
+}
+
+static int transpile_to_c(ExecCtx *ctx, const char *out_path) {
     Func *f = ctx->prog->funcs;
-    
     Func *rev = NULL;
     while (f) {
         Func *next = f->next;
@@ -2143,36 +3303,67 @@ static int transpile_to_c(ExecCtx *ctx, const char *out_path) {
     }
     ctx->prog->funcs = rev;
 
-    bool exec_used = false;
-    dstring body;
-    dstr_init(&body);
-    for (Func *fn = ctx->prog->funcs; fn; fn = fn->next) {
-        dstr_init(&ctx->gen_c);  
-
-        dstring hdr;
-        dstr_init(&hdr);
-        dstr_append_cstr(&hdr, "    /* func \"");
-        dstr_append_cstr(&hdr, fn->name);
-        dstr_append_cstr(&hdr, "\" */\n");
-        exec_stmt_list(ctx, fn->body);
-
-        
-        if (strstr(ctx->gen_c.data, "do_exec(") != NULL) {
-            exec_used = true;
+    /* def_mod libraries */
+    char **libs = NULL;
+    size_t nlibs = 0;
+    for (size_t i = 0; i < ctx->prog->nmods; i++) {
+        const char *m = ctx->prog->mods[i];
+        if (strcmp(m, "libztsl") == 0) continue;
+        char *path = mod_path(m);
+        if (access(path, R_OK) != 0) {
+            zt_error("def_mod %s: %s not found", m, path);
+            free(path);
+            for (size_t k = 0; k < nlibs; k++) free(libs[k]);
+            free(libs);
+            return -1;
         }
-
-        dstr_append_cstr(&body, hdr.data);
-        dstr_append_cstr(&body, ctx->gen_c.data);
-        dstr_free(&hdr);
-        dstr_free(&ctx->gen_c);
+        libs = xrealloc(libs, sizeof(char *) * (nlibs + 1));
+        libs[nlibs++] = path;
     }
 
-    
+    bool exec_used = false;
+    int  gen_rc = 0;
+    int  nfuncs = 0;
+    dstring body;
+    dstr_init(&body);
+
+    if (g_ztv == ZTV_ZTSL26) {
+        /* every func becomes zf_N(); run.func is a real C call */
+        for (Func *fn = ctx->prog->funcs; fn; fn = fn->next) nfuncs++;
+        int idx = 0;
+        for (Func *fn = ctx->prog->funcs; fn; fn = fn->next, idx++) {
+            dstr_init(&ctx->gen_c);
+            int rc = exec_stmt_list(ctx, fn->body);
+            if (rc != 0) gen_rc = rc;
+            dstr_appendf(&body, "static int zf_%d(void) {\n    /* func \"%s\" */\n", idx, fn->name);
+            dstr_append_cstr(&body, ctx->gen_c.data);
+            dstr_append_cstr(&body, "    return 0;\n}\n\n");
+            dstr_free(&ctx->gen_c);
+        }
+    } else {
+        for (Func *fn = ctx->prog->funcs; fn; fn = fn->next) {
+            dstr_init(&ctx->gen_c);
+            dstr_appendf(&body, "    /* func \"%s\" */\n", fn->name);
+            int rc = exec_stmt_list(ctx, fn->body);
+            if (rc != 0) gen_rc = rc;
+            if (strstr(ctx->gen_c.data, "do_exec(") != NULL) exec_used = true;
+            dstr_append_cstr(&body, ctx->gen_c.data);
+            dstr_free(&ctx->gen_c);
+        }
+    }
+    if (gen_rc != 0) {
+        dstr_free(&body);
+        for (size_t k = 0; k < nlibs; k++) free(libs[k]);
+        free(libs);
+        return -1;
+    }
+
     dstring src;
     dstr_init(&src);
     dstr_append_cstr(&src,
         "/* Auto-generated by ztc -e. Do not edit. */\n"
         "#define _POSIX_C_SOURCE 200809L\n"
+        "#define _DEFAULT_SOURCE\n"
         "#include <stdio.h>\n"
         "#include <stdlib.h>\n"
         "#include <string.h>\n"
@@ -2180,7 +3371,32 @@ static int transpile_to_c(ExecCtx *ctx, const char *out_path) {
         "#include <unistd.h>\n"
         "#include <sys/wait.h>\n"
         "#include <sys/types.h>\n"
-        "#include <errno.h>\n\n");
+        "#include <sys/mman.h>\n"
+        "#include <fcntl.h>\n"
+        "#include <signal.h>\n"
+        "#include <errno.h>\n"
+        "#pragma GCC diagnostic ignored \"-Wunused-function\"\n\n");
+
+    if (g_memchk) {
+        dstr_append_cstr(&src, "/* libmemchk is built into ztc (-libmemchk) */\n");
+        append_rt(&src, ZTM_RT_SRC);
+        dstr_append_cstr(&src, "\n");
+    }
+    if (g_ztv == ZTV_ZTSL26) {
+        char **names = NULL;
+        size_t nn = 0;
+        for (Func *fn = ctx->prog->funcs; fn; fn = fn->next)
+            stmts_collect_args(fn->body, &names, &nn);
+        dstr_append_cstr(&src, "static const char *const zt_defined[] = {");
+        for (size_t i = 0; i < nn; i++) {
+            c_escape_append(&src, names[i]);
+            dstr_append_cstr(&src, ", ");
+        }
+        dstr_append_cstr(&src, "NULL};\n");
+        free(names);
+        append_rt(&src, ZT26_RT_SRC);
+        dstr_append_cstr(&src, "\n");
+    }
     if (exec_used) {
         dstr_append_cstr(&src,
             "/* split_args: respects double-quoted arguments (matches ztc runtime) */\n"
@@ -2229,19 +3445,63 @@ static int transpile_to_c(ExecCtx *ctx, const char *out_path) {
             "    return 1;\n"
             "}\n\n");
     }
-    dstr_append_cstr(&src, "int main(void) {\n");
-    dstr_append_cstr(&src, body.data);
-    dstr_append_cstr(&src, "    return 0;\n}\n");
 
-    
+    if (g_memchk) {
+        /* from here on, every malloc/free in the program (including raw C in
+         * ccompat blocks) is the guarded one */
+        dstr_append_cstr(&src,
+            "#define malloc(n)     ztm_malloc(n)\n"
+            "#define calloc(a, b)  ztm_calloc((a), (b))\n"
+            "#define realloc(p, n) ztm_realloc((p), (n))\n"
+            "#define free(p)       ztm_free(p)\n"
+            "#define strdup(s)     ztm_strdup(s)\n"
+            "#define ZTM_INIT()    ztm_init()\n"
+            "#define ZTM_CHK()     ztm_check()\n"
+            "#define ZTM_LEAKS()   ztm_leaks()\n\n");
+    } else {
+        dstr_append_cstr(&src,
+            "#define ZTM_INIT()    ((void)0)\n"
+            "#define ZTM_CHK()     ((void)0)\n"
+            "#define ZTM_LEAKS()   ((void)0)\n\n");
+    }
+
+    if (ctx->nhnames > 0) {
+        dstr_appendf(&src, "static char  *zt_h[%zu];\nstatic size_t zt_hn[%zu];\n\n",
+                     ctx->nhnames, ctx->nhnames);
+    }
+
+    if (g_ztv == ZTV_ZTSL26) {
+        for (int i = 0; i < nfuncs; i++)
+            dstr_appendf(&src, "static int zf_%d(void);\n", i);
+        dstr_append_cstr(&src, "\n");
+        dstr_append_cstr(&src, body.data);
+        dstr_append_cstr(&src,
+            "int main(int argc, char **argv) {\n"
+            "    zt_argc = argc;\n"
+            "    zt_argv = argv;\n"
+            "    ZTM_INIT();\n"
+            "    int zr;\n");
+        int idx = 0;
+        for (Func *fn = ctx->prog->funcs; fn; fn = fn->next, idx++) {
+            if (!func_is_entry(ctx->prog, fn)) continue;
+            dstr_appendf(&src, "    zr = zf_%d(); ZTM_CHK(); if (zr != 0) return zr;\n", idx);
+        }
+        dstr_append_cstr(&src, "    ZTM_LEAKS();\n    return 0;\n}\n");
+    } else {
+        dstr_append_cstr(&src, "int main(void) {\n    ZTM_INIT();\n");
+        dstr_append_cstr(&src, body.data);
+        dstr_append_cstr(&src, "    ZTM_LEAKS();\n    return 0;\n}\n");
+    }
+
     char cpath[1024];
     snprintf(cpath, sizeof(cpath), "%s.c", out_path);
     FILE *cf = fopen(cpath, "w");
     if (!cf) {
-        zt_error("cannot open %s: %s",
-                cpath, strerror(errno));
+        zt_error("cannot open %s: %s", cpath, strerror(errno));
         dstr_free(&src);
         dstr_free(&body);
+        for (size_t k = 0; k < nlibs; k++) free(libs[k]);
+        free(libs);
         return -1;
     }
     fwrite(src.data, 1, src.len, cf);
@@ -2250,11 +3510,21 @@ static int transpile_to_c(ExecCtx *ctx, const char *out_path) {
     dstr_free(&src);
     dstr_free(&body);
 
-    
-    char *gcc_argv[] = {
-        "gcc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-O2",
-        cpath, "-o", (char *)out_path, NULL
-    };
+    char **gcc_argv = xmalloc(sizeof(char *) * (12 + nlibs));
+    int ga = 0;
+    gcc_argv[ga++] = "gcc";
+    gcc_argv[ga++] = "-std=c11";
+    gcc_argv[ga++] = "-Wall";
+    gcc_argv[ga++] = "-Wextra";
+    gcc_argv[ga++] = "-Werror";
+    gcc_argv[ga++] = "-O2";
+    gcc_argv[ga++] = cpath;
+    gcc_argv[ga++] = "-o";
+    gcc_argv[ga++] = (char *)out_path;
+    for (size_t k = 0; k < nlibs; k++) gcc_argv[ga++] = libs[k];
+    if (nlibs) gcc_argv[ga++] = "-Wl,-rpath," ZTSL_LIBDIR;
+    gcc_argv[ga] = NULL;
+
     if (ctx->verbose) {
         fprintf(stderr, "ztc: invoking: gcc");
         for (char **a = gcc_argv + 1; *a; a++) fprintf(stderr, " %s", *a);
@@ -2263,6 +3533,9 @@ static int transpile_to_c(ExecCtx *ctx, const char *out_path) {
     pid_t pid = fork();
     if (pid < 0) {
         zt_error("fork() failed: %s", strerror(errno));
+        free(gcc_argv);
+        for (size_t k = 0; k < nlibs; k++) free(libs[k]);
+        free(libs);
         return -1;
     }
     if (pid == 0) {
@@ -2273,32 +3546,75 @@ static int transpile_to_c(ExecCtx *ctx, const char *out_path) {
     int status = 0;
     waitpid(pid, &status, 0);
     int rc = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    free(gcc_argv);
+    for (size_t k = 0; k < nlibs; k++) free(libs[k]);
+    free(libs);
     if (rc != 0) {
         zt_error("gcc failed (rc=%d)", rc);
         return rc;
     }
-    fprintf(stderr, "Generated C code and ELF in %s and %s\n", out_path, cpath);
+    fprintf(stderr, "Generated C code and ELF in %s and %s%s\n", out_path, cpath,
+            g_memchk ? " (libmemchk)" : "");
     return 0;
 }
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "ztc %s - ZTSL build tool\n"
+        "ztc %s (ZTSL %s) - ZTSL build tool\n"
         "Usage: %s [options] [target ...]\n"
-        "       %s -o <out> <file.ztsl>\n"
-        "  -f <file>   Build file (default: build.ztsl)\n"
-        "  -e <out>    Transpile to C and produce executable <out>\n"
-        "  -o <out>    Same as -e, but takes the .ztsl path as a\n"
-        "              positional argument instead of -f\n"
-        "  -l          List available functions and exit\n"
-        "  -F          Force (ignore cache)\n"
-        "  -v          Verbose\n"
-        "  -V          Print version and exit\n"
-        "  -h          Help\n",
-        ZTC_VERSION, argv0, argv0);
+        "       %s -o <out> <file.ztsl> [-libmemchk] [-ztv=<version>]\n"
+        "  -f <file>      Build file (default: build.ztsl)\n"
+        "  -e <out>       Transpile to C and produce executable <out>\n"
+        "  -o <out>       Same as -e, but takes the .ztsl path as a\n"
+        "                 positional argument instead of -f\n"
+        "  -ztv=<ver>     Language version:\n"
+        "                   p26     ZTSL p26 (ztc 0.1), the original syntax (default)\n"
+        "                   ztsl26  ZTSL 26  (ztc 0.26): def_mod, run.func, 'if argument',\n"
+        "                           sys.exec.silent, %%a%% / %%ea%%\n"
+        "  -libmemchk     Built-in memory checker: use-after-free, double free, leak\n"
+        "                 and buffer overflow print 'E: Value Out of Bounds (...)' and\n"
+        "                 segfault (guards mem.* and malloc/free inside ccompat)\n"
+        "  -l             List available functions and exit\n"
+        "  -F             Force (ignore cache)\n"
+        "  -v             Verbose\n"
+        "  -V             Print version and exit\n"
+        "  -h             Help\n"
+        "In -ztv=ztsl26 interpreted runs, words after the file are the program's\n"
+        "arguments: %s -ztv=ztsl26 prog.ztsl create mysnap\n",
+        g_ztv == ZTV_P26 ? ZTC_VERSION_P26 : ZTC_VERSION,
+        g_ztv == ZTV_P26 ? "p26" : "ztsl26", argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv) {
+    /* -ztv=<ver> and -libmemchk are single-dash words getopt would take for
+     * clusters of short options, so pull them out first (anywhere on the line,
+     * up to a lone "--"). */
+    {
+        char **fa = xmalloc(sizeof(char *) * ((size_t)argc + 1));
+        int fc = 0;
+        bool scanning = true;
+        for (int i = 0; i < argc; i++) {
+            if (scanning && i > 0 && strcmp(argv[i], "--") == 0) {
+                scanning = false;
+            } else if (scanning && i > 0 && strncmp(argv[i], "-ztv=", 5) == 0) {
+                const char *v = argv[i] + 5;
+                if (strcmp(v, "p26") == 0) g_ztv = ZTV_P26;
+                else if (strcmp(v, "ztsl26") == 0) g_ztv = ZTV_ZTSL26;
+                else {
+                    zt_error("unknown -ztv version '%s' (expected p26 or ztsl26)", v);
+                    return 2;
+                }
+                continue;
+            } else if (scanning && i > 0 && strcmp(argv[i], "-libmemchk") == 0) {
+                g_memchk = true;
+                continue;
+            }
+            fa[fc++] = argv[i];
+        }
+        fa[fc] = NULL;
+        argv = fa;
+        argc = fc;
+    }
     const char *prog_name = argv[0] ? argv[0] : "ztc";
     const char *pn_slash = strrchr(prog_name, '/');
     if (pn_slash) prog_name = pn_slash + 1;
@@ -2308,17 +3624,22 @@ int main(int argc, char **argv) {
     bool force = false;
     bool verbose = false;
     bool positional_file = false;
+    bool f_given = false;
 
     int opt;
     while ((opt = getopt(argc, argv, "+f:e:o:lFvVh")) != -1) {
         switch (opt) {
-            case 'f': build_file = optarg; break;
+            case 'f': build_file = optarg; f_given = true; break;
             case 'e': exec_out   = optarg; break;
             case 'o': exec_out   = optarg; positional_file = true; break;
             case 'l': list_only  = true;   break;
             case 'F': force      = true;   break;
             case 'v': verbose   = true;    break;
-            case 'V': printf("ztc %s\n", ZTC_VERSION); return 0;
+            case 'V':
+                printf("ztc %s (ZTSL %s)\n",
+                       g_ztv == ZTV_P26 ? ZTC_VERSION_P26 : ZTC_VERSION,
+                       g_ztv == ZTV_P26 ? "p26" : "ztsl26");
+                return 0;
             case 'h': usage(argv[0]); return 0;
             default:  usage(argv[0]); return 2;
         }
@@ -2330,6 +3651,28 @@ int main(int argc, char **argv) {
     if (optind < argc) {
         targets = &argv[optind];
         ntargets = argc - optind;
+    }
+
+    /* a memchk run must always really execute: never short-circuit it through
+     * the p26 hash cache */
+    if (g_memchk) force = true;
+
+    /* ztsl26 interpreted run: words after the file are the program's arguments */
+    char **prog_args = NULL;
+    int nprog_args = 0;
+    if (g_ztv == ZTV_ZTSL26 && !exec_out) {
+        if (!f_given && ntargets > 0) {
+            size_t tl = strlen(targets[0]);
+            if (tl > 5 && strcmp(targets[0] + tl - 5, ".ztsl") == 0) {
+                build_file = targets[0];
+                targets++;
+                ntargets--;
+            }
+        }
+        prog_args = targets;
+        nprog_args = ntargets;
+        targets = NULL;
+        ntargets = 0;
     }
 
     if (positional_file) {
@@ -2388,7 +3731,7 @@ int main(int argc, char **argv) {
     if (dot) *dot = '\0';
 
     const char *hashdir = "hash";
-    mkdir(hashdir, 0755);
+    if (g_ztv == ZTV_P26) mkdir(hashdir, 0755);   /* cache is a p26 build-tool feature */
     char *stored = read_stored_hash(hashdir, base_noext);
 
     bool cache_hit = false;
@@ -2503,6 +3846,7 @@ int main(int argc, char **argv) {
     
     if (exec_out) {
         ExecCtx ctx;
+        memset(&ctx, 0, sizeof(ctx));
         ctx.prog    = &prog;
         ctx.vars    = &prog.vars;
         ctx.verbose = verbose;
@@ -2518,6 +3862,49 @@ int main(int argc, char **argv) {
     }
 
     
+    if (g_ztv == ZTV_ZTSL26) {
+        /* ZTSL 26 programs are run, not built: no hash cache. Entry funcs
+         * (the 'if argument' guards) run in source order. */
+        ExecCtx zctx;
+        memset(&zctx, 0, sizeof(zctx));
+        zctx.prog    = &prog;
+        zctx.vars    = &prog.vars;
+        zctx.verbose = verbose;
+        zctx.force   = force;
+        zctx.args    = prog_args;
+        zctx.nargs   = nprog_args;
+
+        Func *zrev = NULL;
+        Func *zf = prog.funcs;
+        while (zf) {
+            Func *next = zf->next;
+            zf->next = zrev;
+            zrev = zf;
+            zf = next;
+        }
+        prog.funcs = zrev;
+
+        int zrc = 0;
+        for (Func *fn = prog.funcs; fn; fn = fn->next) {
+            if (!func_is_entry(&prog, fn)) continue;
+            if (verbose) fprintf(stderr, "ztc: === func %s ===\n", fn->name);
+            zrc = exec_stmt_list(&zctx, fn->body);
+            if (zrc != 0) {
+                if (zrc != 2) zt_error("function %s failed (rc=%d)", fn->name, zrc);
+                break;
+            }
+        }
+        if (zrc == 0 && g_memchk) zrc = mem_leak_since(&zctx, 0);
+        mem_free_all(&zctx);
+        linebuf_free(&lb);
+        var_free(prog.vars);
+        func_free(prog.funcs);
+        prog_free_mods(&prog);
+        free(new_hash);
+        free(stored);
+        return zrc == 0 ? 0 : (zrc == 2 ? 2 : 1);
+    }
+
     if (cache_hit && ntargets == 0) {
         
         bool all_hit = true;
@@ -2556,6 +3943,7 @@ int main(int argc, char **argv) {
 
     
     ExecCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
     ctx.prog    = &prog;
     ctx.vars    = &prog.vars;
     ctx.verbose = verbose;
@@ -2646,6 +4034,9 @@ int main(int argc, char **argv) {
     }
 
     
+    if (rc == 0 && g_memchk) rc = mem_leak_since(&ctx, 0);
+    mem_free_all(&ctx);
+
     if (rc == 0) {
         
         write_stored_hash(hashdir, base_noext, new_hash);
