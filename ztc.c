@@ -19,6 +19,7 @@
 #include <stdint.h>
 
 #include <sys/utsname.h>
+#include <dlfcn.h>
 
 #include <openssl/sha.h>
 
@@ -336,6 +337,7 @@ typedef enum {
     K_MEMFREE,
     K_MEMWRITE,
     K_MEMSHOW,
+    K_LIBCALL,
 } StmtKind;
 
 typedef enum {
@@ -383,6 +385,7 @@ struct Stmt {
         struct { int width; char op; char *lhs_raw; char *rhs_raw; char *varname; } floatcalc;
         struct { char *name; } runfunc;
         struct { char *name; char *num; char *text; } mem;
+        struct { size_t idx; char **args; int nargs; char *varname; } libcall;
     };
 };
 
@@ -398,12 +401,27 @@ typedef struct Var {
     struct Var *next;
 } Var;
 
+/* ---- ZTSL module ABI: what a def_mod library exports ----
+ *   const ztsl_module ztsl_module_<name> = { 1, "<name>", stmts };
+ * 'stmts' ends with { NULL, NULL }. A statement receives its arguments as
+ * text and returns 0 (ok) or non-zero (error); '*out' is a string malloc'd by
+ * the library (the result, or the error message). */
+#define ZTSL_ABI 1
+typedef int (*ZtslStmtFn)(int argc, const char *const *argv, char **out);
+typedef struct { const char *name; ZtslStmtFn fn; } ZtslStmtEntry;
+typedef struct { unsigned abi; const char *name; const ZtslStmtEntry *stmts; } ZtslModule;
+
+typedef struct { char *name; ZtslStmtFn fn; size_t mod; } LibStmt;
+
 typedef struct {
     Func *funcs;
     Var  *vars;
     bool  inline_ztslo_used;
     char **mods;      /* def_mod names (ztsl26) */
+    void **modh;      /* dlopen handles, parallel to mods */
     size_t nmods;
+    LibStmt *lstmts;  /* statements provided by libraries */
+    size_t nlstmts;
 } Program;
 
 typedef struct {
@@ -412,6 +430,7 @@ typedef struct {
     bool     error;
     char    *err_msg;
     int      if_depth;   /* nesting of 'if' being parsed */
+    Program *prog;       /* for library statements */
 } Parser;
 
 static void parse_error(Parser *p, const char *msg) {
@@ -471,6 +490,9 @@ static char *extract_quoted(const char *s, const char **endp) {
     return out;
 }
 
+static char **split_args(const char *cmd, int *argc_out);
+static void free_args(char **argv);
+
 static void stmt_free(Stmt *s) {
     while (s) {
         Stmt *next = s->next;
@@ -524,6 +546,10 @@ static void stmt_free(Stmt *s) {
                 free(s->mem.name);
                 free(s->mem.num);
                 free(s->mem.text);
+                break;
+            case K_LIBCALL:
+                free_args(s->libcall.args);
+                free(s->libcall.varname);
                 break;
         }
         free(s);
@@ -731,6 +757,141 @@ static bool match_float_calc_kw(const char *line, int *width_out, size_t *len_ou
     return true;
 }
 
+#define ZTSL_LIBDIR "/usr/lib/ztsl"
+
+/* def_mod NAME -> /usr/lib/ztsl/NAME-<arch>.so (libs are written in C).
+ * 'libztsl' is the built-in runtime: ztc ignores it and compiles the program. */
+static char *mod_path(const char *name) {
+    struct utsname u;
+    const char *arch = (uname(&u) == 0) ? u.machine : "unknown";
+    size_t n = strlen(ZTSL_LIBDIR) + strlen(name) + strlen(arch) + 8;
+    char *path = xmalloc(n);
+    snprintf(path, n, "%s/%s-%s.so", ZTSL_LIBDIR, name, arch);
+    return path;
+}
+
+/* symbol a module exports: ztsl_module_<name> (non-alphanumerics become '_') */
+static char *mod_symbol(const char *name) {
+    size_t n = strlen(name) + 16;
+    char *sym = xmalloc(n);
+    snprintf(sym, n, "ztsl_module_%s", name);
+    for (char *c = sym + 12; *c; c++)
+        if (!isalnum((unsigned char)*c)) *c = '_';
+    return sym;
+}
+
+static bool is_builtin_stmt_name(const char *n) {
+    static const char *kw[] = {
+        "define", "if", "else", "endif", "func", "sys.exec", "sys.exec.silent",
+        "text.show", "delete_file", "create_file", "write_on_file", "append_file",
+        "ccompat", "run.func", "def_mod", "mem.alloc", "mem.free", "mem.write",
+        "mem.show", "ztsl.start", "ztsl.end", "ztslo.start", "ztslo.end", NULL
+    };
+    for (size_t i = 0; kw[i]; i++)
+        if (strcasecmp(n, kw[i]) == 0) return true;
+    size_t nl = strlen(n);
+    if (strncasecmp(n, "float", 5) == 0 && nl > 15 &&
+        strcasecmp(n + nl - 10, "_calculate") == 0) return true;
+    return false;
+}
+
+/* index of the library statement that starts 'line', or -1 */
+static long find_lib_stmt(const Program *prog, const char *line) {
+    if (!prog) return -1;
+    for (size_t i = 0; i < prog->nlstmts; i++) {
+        size_t n = strlen(prog->lstmts[i].name);
+        if (strncmp(line, prog->lstmts[i].name, n) == 0 &&
+            (line[n] == '\0' || isspace((unsigned char)line[n])))
+            return (long)i;
+    }
+    return -1;
+}
+
+/* def_mod: records the module and loads it (dlopen) so its statements can be
+ * parsed. Takes ownership of 'name'. Returns false (with a parse error) when
+ * the library is missing, cannot be loaded, or breaks the ABI. */
+static bool prog_load_mod(Parser *p, Program *prog, char *name) {
+    for (size_t i = 0; i < prog->nmods; i++)
+        if (strcmp(prog->mods[i], name) == 0) { free(name); return true; }
+    size_t idx = prog->nmods;
+    prog->mods = xrealloc(prog->mods, sizeof(char *) * (idx + 1));
+    prog->modh = xrealloc(prog->modh, sizeof(void *) * (idx + 1));
+    prog->mods[idx] = name;
+    prog->modh[idx] = NULL;
+    prog->nmods++;
+    if (strcmp(name, "libztsl") == 0) return true;
+
+    char *path = mod_path(name);
+    if (access(path, R_OK) != 0) {
+        zt_error("def_mod %s: %s not found", name, path);
+        free(path);
+        parse_error(p, "def_mod library not found");
+        return false;
+    }
+    void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!h) {
+        const char *why = dlerror();
+        zt_error("def_mod %s: cannot load %s: %s", name, path, why ? why : "?");
+        free(path);
+        parse_error(p, "def_mod library cannot be loaded");
+        return false;
+    }
+    prog->modh[idx] = h;
+    char *sym = mod_symbol(name);
+    const ZtslModule *m = (const ZtslModule *)dlsym(h, sym);
+    free(path);
+    if (!m) {         /* a plain C library used only through ccompat */
+        free(sym);
+        return true;
+    }
+    if (m->abi != ZTSL_ABI || !m->name || strcmp(m->name, name) != 0 || !m->stmts) {
+        zt_error("def_mod %s: %s is not a valid ZTSL module (abi %u, expected %d; "
+                 "name '%s')", name, sym, m->abi, ZTSL_ABI, m->name ? m->name : "?");
+        free(sym);
+        parse_error(p, "invalid ZTSL module");
+        return false;
+    }
+    free(sym);
+    for (const ZtslStmtEntry *e = m->stmts; e->name; e++) {
+        bool bad = (e->name[0] == '\0' || !e->fn);
+        for (const char *c = e->name; *c; c++)
+            if (isspace((unsigned char)*c) || *c == '"') bad = true;
+        if (bad || is_builtin_stmt_name(e->name)) {
+            zt_error("def_mod %s: statement name '%s' is invalid or reserved",
+                     name, e->name ? e->name : "(null)");
+            parse_error(p, "bad library statement name");
+            return false;
+        }
+        if (find_lib_stmt(prog, e->name) >= 0) {
+            zt_error("def_mod %s: statement '%s' is already provided by another module",
+                     name, e->name);
+            parse_error(p, "duplicate library statement");
+            return false;
+        }
+        prog->lstmts = xrealloc(prog->lstmts, sizeof(LibStmt) * (prog->nlstmts + 1));
+        prog->lstmts[prog->nlstmts].name = xstrdup(e->name);
+        prog->lstmts[prog->nlstmts].fn = e->fn;
+        prog->lstmts[prog->nlstmts].mod = idx;
+        prog->nlstmts++;
+    }
+    return true;
+}
+
+static void prog_free_mods(Program *prog) {
+    for (size_t i = 0; i < prog->nmods; i++) {
+        free(prog->mods[i]);
+        if (prog->modh && prog->modh[i]) dlclose(prog->modh[i]);
+    }
+    for (size_t i = 0; i < prog->nlstmts; i++) free(prog->lstmts[i].name);
+    free(prog->mods);
+    free(prog->modh);
+    free(prog->lstmts);
+    prog->mods = NULL;
+    prog->modh = NULL;
+    prog->lstmts = NULL;
+    prog->nmods = prog->nlstmts = 0;
+}
+
 static bool reject_if_misplaced_statement(Parser *p, const char *line) {
     int width; size_t kwlen;
     if (match_float_calc_kw(line, &width, &kwlen)) {
@@ -744,6 +905,13 @@ static bool reject_if_misplaced_statement(Parser *p, const char *line) {
         zt_error("'define' must be inside a func \"name\" { ... } body "
                 "or a ztslo.start/ztslo.end block, not here: '%s'", line);
         parse_error(p, "define outside a func body or ztslo block");
+        return true;
+    }
+
+    if (find_lib_stmt(p->prog, line) >= 0) {
+        zt_error("library statement must be inside a func \"name\" "
+                "{ ... } body, not here: '%s'", line);
+        parse_error(p, "library statement outside a func body");
         return true;
     }
 
@@ -805,20 +973,31 @@ static bool require_ztsl26(Parser *p, const char *what) {
     return false;
 }
 
-/* Takes ownership of 'name'. */
-static void prog_add_mod(Program *prog, char *name) {
-    for (size_t i = 0; i < prog->nmods; i++) {
-        if (strcmp(prog->mods[i], name) == 0) { free(name); return; }
+/* <library statement> ARG... [as variable "name"] */
+static Stmt *parse_libcall(Parser *p, long idx) {
+    char *l = consume(p);
+    size_t nl = strlen(p->prog->lstmts[idx].name);
+    int argc = 0;
+    char **argv = split_args(l + nl, &argc);
+    free(l);
+    char *varname = NULL;
+    if (argc >= 3 && strcasecmp(argv[argc - 3], "as") == 0 &&
+        strcasecmp(argv[argc - 2], "variable") == 0) {
+        varname = xstrdup(argv[argc - 1]);
+        free(argv[argc - 3]);
+        free(argv[argc - 2]);
+        free(argv[argc - 1]);
+        argv[argc - 3] = NULL;
+        argc -= 3;
     }
-    prog->mods = xrealloc(prog->mods, sizeof(char *) * (prog->nmods + 1));
-    prog->mods[prog->nmods++] = name;
-}
-
-static void prog_free_mods(Program *prog) {
-    for (size_t i = 0; i < prog->nmods; i++) free(prog->mods[i]);
-    free(prog->mods);
-    prog->mods = NULL;
-    prog->nmods = 0;
+    Stmt *s = xmalloc(sizeof(Stmt));
+    memset(s, 0, sizeof(*s));
+    s->kind = K_LIBCALL;
+    s->libcall.idx = (size_t)idx;
+    s->libcall.args = argv;
+    s->libcall.nargs = argc;
+    s->libcall.varname = varname;
+    return s;
 }
 
 /* "if argument ..." */
@@ -1413,6 +1592,11 @@ static Stmt *parse_stmt(Parser *p) {
     }
 
     
+    {
+        long li = find_lib_stmt(p->prog, line);
+        if (li >= 0) return parse_libcall(p, li);
+    }
+
     char *l = consume(p);
     if (l) {
         const char *sug = suggest_keyword(l);
@@ -1629,7 +1813,7 @@ static void parse_program(Parser *p, Program *prog) {
                 parse_error(p, "expected module name after 'def_mod'");
                 return;
             }
-            prog_add_mod(prog, mname);
+            if (!prog_load_mod(p, prog, mname)) return;
             continue;
         }
         if (starts_with_kw(l, "ztsl.start") || starts_with_kw(l, "zstl.start")) {
@@ -1747,6 +1931,11 @@ typedef struct {
     /* transpile: handle names -> zt_h[] indexes */
     char   **hnames;
     size_t   nhnames;
+    /* results of library statements ("as variable"): expanded like %ea%,
+     * so a value can never inject shell syntax */
+    Var     *rvars;
+    char   **rtvars;
+    size_t   nrtvars;
 } ExecCtx;
 
 /* ---- memchk failure path (shared by the interpreter) ----
@@ -1892,7 +2081,7 @@ static void mem_free_all(ExecCtx *ctx) {
 /* ---- %a% / %ea% expansion (ztsl26) ----
  * %a% is the first program argument, %ea% the one after it. With quote=true
  * the values are single-quoted so they cannot inject shell syntax. */
-static char *expand_args(char **args, int nargs, const char *tmpl, bool quote) {
+static char *expand_args(char **args, int nargs, Var *rvars, const char *tmpl, bool quote) {
     dstring out;
     dstr_init(&out);
     for (const char *p = tmpl; *p; ) {
@@ -1900,6 +2089,14 @@ static char *expand_args(char **args, int nargs, const char *tmpl, bool quote) {
         size_t adv = 0;
         if (strncmp(p, "%ea%", 4) == 0) { val = nargs > 1 ? args[1] : ""; adv = 4; }
         else if (strncmp(p, "%a%", 3) == 0) { val = nargs > 0 ? args[0] : ""; adv = 3; }
+        if (!val && *p == '@' && (isalpha((unsigned char)p[1]) || p[1] == '_')) {
+            const char *q = p + 1;
+            while (isalnum((unsigned char)*q) || *q == '_') q++;
+            char *nm = xstrndup(p + 1, (size_t)(q - p - 1));
+            Var *rv = var_find(rvars, nm);
+            free(nm);
+            if (rv) { val = rv->value; adv = (size_t)(q - p); }
+        }
         if (!val) { dstr_append_char(&out, *p++); continue; }
         p += adv;
         if (!quote) { dstr_append_cstr(&out, val); continue; }
@@ -2096,9 +2293,10 @@ static char *compute_float_calc(int width, const char *lhs_s, char op,
     return xstrdup(buf);
 }
 
-static bool eval_cond(Cond *c, Var *vars) {
+static bool eval_cond(Cond *c, Var *vars, Var *rvars) {
     if (c->kind == COND_EMPTYFILE) {
         Var *v = var_find(vars, c->var);
+        if (!v) v = var_find(rvars, c->var);
         const char *path = v ? v->value : "";
         bool empty = path_is_empty_file(path);
         return c->is_is ? empty : !empty;
@@ -2114,6 +2312,7 @@ static bool eval_cond(Cond *c, Var *vars) {
         val = file_content;
     } else {
         Var *v = var_find(vars, c->var);
+        if (!v) v = var_find(rvars, c->var);
         val = v ? v->value : "";
     }
 
@@ -2269,7 +2468,7 @@ static int run_exec(const char *cmd) {
 static int run_cmd26(ExecCtx *ctx, const char *code, bool is_shell, bool silent) {
     int rc;
     if (is_shell) {
-        char *cmd = expand_args(ctx->args, ctx->nargs, code, true);
+        char *cmd = expand_args(ctx->args, ctx->nargs, ctx->rvars, code, true);
         if (silent) {
             dstring full;
             dstr_init(&full);
@@ -2292,7 +2491,7 @@ static int run_cmd26(ExecCtx *ctx, const char *code, bool is_shell, bool silent)
         return -1;
     }
     for (int i = 0; i < argc; i++) {
-        char *e = expand_args(ctx->args, ctx->nargs, argv[i], false);
+        char *e = expand_args(ctx->args, ctx->nargs, ctx->rvars, argv[i], false);
         free(argv[i]);
         argv[i] = e;
     }
@@ -2337,10 +2536,33 @@ static int exec_stmt_list(ExecCtx *ctx, Stmt *list) {
 
 /* Conditions that can only be decided when the compiled program runs
  * (arguments, last command result). The rest are folded at transpile time. */
-static bool cond_is_runtime(const Cond *c) {
+static bool ctx_has_rtvar(const ExecCtx *ctx, const char *name) {
+    for (size_t i = 0; i < ctx->nrtvars; i++)
+        if (strcasecmp(ctx->rtvars[i], name) == 0) return true;
+    return false;
+}
+
+static bool cond_is_runtime(const ExecCtx *ctx, const Cond *c) {
     if (c->kind == COND_ARG_PASSED || c->kind == COND_ARG_UNDEF) return true;
-    return g_ztv == ZTV_ZTSL26 && c->kind == COND_EQ && c->subj == SUBJ_VAR &&
-           c->var && strcasecmp(c->var, "result") == 0;
+    if (g_ztv != ZTV_ZTSL26 || c->kind != COND_EQ || c->subj != SUBJ_VAR || !c->var)
+        return false;
+    return strcasecmp(c->var, "result") == 0 || ctx_has_rtvar(ctx, c->var);
+}
+
+/* names assigned by library statements (known before code generation, so an
+ * 'if' may come before the assignment in the source and still be right) */
+static void stmts_collect_rtvars(Stmt *s, ExecCtx *ctx) {
+    for (; s; s = s->next) {
+        if (s->kind == K_LIBCALL && s->libcall.varname &&
+            !ctx_has_rtvar(ctx, s->libcall.varname)) {
+            ctx->rtvars = xrealloc(ctx->rtvars, sizeof(char *) * (ctx->nrtvars + 1));
+            ctx->rtvars[ctx->nrtvars++] = s->libcall.varname;
+        }
+        if (s->kind == K_IF) {
+            stmts_collect_rtvars(s->cond.then_branch, ctx);
+            stmts_collect_rtvars(s->cond.else_branch, ctx);
+        }
+    }
 }
 
 static int hindex(ExecCtx *ctx, const char *name) {
@@ -2403,7 +2625,13 @@ static int gen_runtime_if(ExecCtx *ctx, Stmt *s) {
         for (size_t i = 0; i < c->nvalues; i++) {
             char *sv = subst_vars(c->values[i], *ctx->vars);
             if (i) dstr_append_cstr(g, " || ");
-            dstr_append_cstr(g, "zt_res_eq(");
+            if (strcasecmp(c->var, "result") == 0) {
+                dstr_append_cstr(g, "zt_res_eq(");
+            } else {
+                dstr_append_cstr(g, "zt_var_eq(");
+                c_escape_append(g, c->var);
+                dstr_append_cstr(g, ", ");
+            }
             c_escape_append(g, sv);
             dstr_append_cstr(g, ")");
             free(sv);
@@ -2516,7 +2744,7 @@ static int exec_stmt(ExecCtx *ctx, Stmt *s) {
             return 0;
         }
         case K_IF: {
-            if (ctx->dry_run && cond_is_runtime(&s->cond))
+            if (ctx->dry_run && cond_is_runtime(ctx, &s->cond))
                 return gen_runtime_if(ctx, s);
             bool ok;
             if (s->cond.kind == COND_ARG_PASSED || s->cond.kind == COND_ARG_UNDEF) {
@@ -2524,7 +2752,7 @@ static int exec_stmt(ExecCtx *ctx, Stmt *s) {
                 ok = eval_arg_cond(ctx, &s->cond, &usage_rc);
                 if (usage_rc != 0) return usage_rc;
             } else {
-                ok = eval_cond(&s->cond, *ctx->vars);
+                ok = eval_cond(&s->cond, *ctx->vars, ctx->rvars);
             }
             if (ctx->verbose) {
                 if (s->cond.kind == COND_ARG_PASSED) {
@@ -2604,7 +2832,7 @@ static int exec_stmt(ExecCtx *ctx, Stmt *s) {
                     dstr_append_cstr(&ctx->gen_c, ", stdout); fflush(stdout);\n");
                 }
             } else if (g_ztv == ZTV_ZTSL26) {
-                char *e = expand_args(ctx->args, ctx->nargs, code, false);
+                char *e = expand_args(ctx->args, ctx->nargs, ctx->rvars, code, false);
                 fputs(e, stdout);
                 fflush(stdout);
                 free(e);
@@ -2756,6 +2984,57 @@ static int exec_stmt(ExecCtx *ctx, Stmt *s) {
         case K_MEMWRITE:
         case K_MEMSHOW:
             return exec_mem(ctx, s);
+        case K_LIBCALL: {
+            const LibStmt *ls = &ctx->prog->lstmts[s->libcall.idx];
+            int n = s->libcall.nargs;
+            if (ctx->dry_run) {
+                /* the call happens when the compiled program runs; @vars known
+                 * now are substituted, %a%/%ea% and library results are left
+                 * for run time */
+                char *sym = mod_symbol(ctx->prog->mods[ls->mod]);
+                dstring *g = &ctx->gen_c;
+                dstr_append_cstr(g, "    { const char *za[] = {");
+                for (int i = 0; i < n; i++) {
+                    char *t = subst_vars(s->libcall.args[i], *ctx->vars);
+                    c_escape_append(g, t);
+                    dstr_append_cstr(g, ", ");
+                    free(t);
+                }
+                dstr_appendf(g, "NULL};\n    if (zt_libcall(&%s, ", sym);
+                c_escape_append(g, ls->name);
+                dstr_appendf(g, ", za, %d, ", n);
+                if (s->libcall.varname) c_escape_append(g, s->libcall.varname);
+                else dstr_append_cstr(g, "NULL");
+                dstr_append_cstr(g, ") != 0) return 1; }\n");
+                free(sym);
+                return 0;
+            }
+            char **av = xmalloc(sizeof(char *) * ((size_t)n + 1));
+            for (int i = 0; i < n; i++) {
+                char *t = subst_vars(s->libcall.args[i], *ctx->vars);
+                av[i] = expand_args(ctx->args, ctx->nargs, ctx->rvars, t, false);
+                free(t);
+            }
+            av[n] = NULL;
+            if (ctx->verbose) fprintf(stderr, "[lib] %s (%d args)\n", ls->name, n);
+            char *out = NULL;
+            int rc = ls->fn(n, (const char *const *)av, &out);
+            free_args(av);
+            if (rc != 0) {
+                zt_error("%s: %s", ls->name, out ? out : "failed");
+                free(out);
+                return 1;
+            }
+            if (s->libcall.varname) {
+                var_set(&ctx->rvars, s->libcall.varname, out ? out : "");
+            } else if (out) {
+                fputs(out, stdout);
+                fputc('\n', stdout);
+                fflush(stdout);
+            }
+            free(out);
+            return 0;
+        }
     }
     return 0;
 }
@@ -2864,6 +3143,18 @@ static void serialize_stmt(dstring *out, Stmt *s) {
             dstr_append_char(out, '\n');
             break;
         }
+        case K_LIBCALL:
+            dstr_appendf(out, "LIBCALL %zu", s->libcall.idx);
+            for (int i = 0; i < s->libcall.nargs; i++) {
+                dstr_append_char(out, ' ');
+                dstr_append_cstr(out, s->libcall.args[i]);
+            }
+            if (s->libcall.varname) {
+                dstr_append_cstr(out, " AS ");
+                dstr_append_cstr(out, s->libcall.varname);
+            }
+            dstr_append_char(out, '\n');
+            break;
         case K_RUNFUNC:
             dstr_append_cstr(out, "RUNFUNC ");
             dstr_append_cstr(out, s->runfunc.name);
@@ -3162,6 +3453,45 @@ static const char *const ZT26_RT_SRC[] = {
     "    b->p[b->n] = '\\0';\n",
     "}\n",
     "\n",
+    "/* ---- runtime variables: results of library statements (\"as variable\") ---- */\n",
+    "typedef struct zt_var { char *name; char *val; struct zt_var *next; } zt_var;\n",
+    "static zt_var *zt_vars;\n",
+    "\n",
+    "static void zt_setvar(const char *name, const char *val) {\n",
+    "    for (zt_var *v = zt_vars; v; v = v->next) {\n",
+    "        if (strcasecmp(v->name, name) == 0) {\n",
+    "            char *nv = strdup(val);\n",
+    "            if (!nv) { fputs(\"E: out of memory\\n\", stderr); exit(1); }\n",
+    "            free(v->val);\n",
+    "            v->val = nv;\n",
+    "            return;\n",
+    "        }\n",
+    "    }\n",
+    "    zt_var *v = malloc(sizeof *v);\n",
+    "    if (!v) { fputs(\"E: out of memory\\n\", stderr); exit(1); }\n",
+    "    v->name = strdup(name);\n",
+    "    v->val = strdup(val);\n",
+    "    if (!v->name || !v->val) { fputs(\"E: out of memory\\n\", stderr); exit(1); }\n",
+    "    v->next = zt_vars;\n",
+    "    zt_vars = v;\n",
+    "}\n",
+    "\n",
+    "static const char *zt_getvar(const char *name) {\n",
+    "    for (zt_var *v = zt_vars; v; v = v->next)\n",
+    "        if (strcasecmp(v->name, name) == 0) return v->val;\n",
+    "    return NULL;\n",
+    "}\n",
+    "\n",
+    "static int zt_var_eq(const char *name, const char *val) {\n",
+    "    const char *v = zt_getvar(name);\n",
+    "    return strcmp(v ? v : \"\", val) == 0;\n",
+    "}\n",
+    "\n",
+    "/* ---- ZTSL module ABI (what a def_mod library exports) ---- */\n",
+    "typedef int (*ztsl_stmt_fn)(int argc, const char *const *argv, char **out);\n",
+    "typedef struct { const char *name; ztsl_stmt_fn fn; } ztsl_stmt;\n",
+    "typedef struct { unsigned abi; const char *name; const ztsl_stmt *stmts; } ztsl_module;\n",
+    "\n",
     "/* %a% = first program argument, %ea% = the one after it.\n",
     " * quote != 0: values are single-quoted for sh (no shell injection). */\n",
     "static char *zt_expand(const char *t, int quote) {\n",
@@ -3172,6 +3502,18 @@ static const char *const ZT26_RT_SRC[] = {
     "        size_t adv = 0;\n",
     "        if (strncmp(t, \"%ea%\", 4) == 0) { val = zt_argc > 2 ? zt_argv[2] : \"\"; adv = 4; }\n",
     "        else if (strncmp(t, \"%a%\", 3) == 0) { val = zt_argc > 1 ? zt_argv[1] : \"\"; adv = 3; }\n",
+    "        if (!val && *t == '@' && (isalpha((unsigned char)t[1]) || t[1] == '_')) {\n",
+    "            const char *q = t + 1;\n",
+    "            while (isalnum((unsigned char)*q) || *q == '_') q++;\n",
+    "            char nm[128];\n",
+    "            size_t nl = (size_t)(q - t - 1);\n",
+    "            if (nl < sizeof nm) {\n",
+    "                memcpy(nm, t + 1, nl);\n",
+    "                nm[nl] = '\\0';\n",
+    "                const char *lv = zt_getvar(nm);\n",
+    "                if (lv) { val = lv; adv = (size_t)(q - t); }\n",
+    "            }\n",
+    "        }\n",
     "        if (!val) { zt_bput(&b, t, 1); t++; continue; }\n",
     "        t += adv;\n",
     "        if (!quote) { zt_bput(&b, val, strlen(val)); continue; }\n",
@@ -3272,6 +3614,33 @@ static const char *const ZT26_RT_SRC[] = {
     "    zt_handled = 1;\n",
     "    return 1;\n",
     "}\n",
+    "\n",
+    "/* Calls library statement 'name' of module 'm'. Arguments are expanded at run\n",
+    " * time (%a%, %ea%, @var). The library's 'out' string is malloc'd by the\n",
+    " * library: stored in 'var' when given, otherwise printed. */\n",
+    "static int zt_libcall(const ztsl_module *m, const char *name,\n",
+    "                      const char *const *tmpl, int n, const char *var) {\n",
+    "    ztsl_stmt_fn fn = NULL;\n",
+    "    for (const ztsl_stmt *e = m->stmts; e->name; e++)\n",
+    "        if (strcmp(e->name, name) == 0) { fn = e->fn; break; }\n",
+    "    if (!fn) { fprintf(stderr, \"E: %s: statement not found in module %s\\n\", name, m->name); return 1; }\n",
+    "    char **av = calloc((size_t)n + 1, sizeof *av);\n",
+    "    if (!av) return 1;\n",
+    "    for (int i = 0; i < n; i++) av[i] = zt_expand(tmpl[i], 0);\n",
+    "    char *out = NULL;\n",
+    "    int rc = fn(n, (const char *const *)av, &out);\n",
+    "    for (int i = 0; i < n; i++) free(av[i]);\n",
+    "    free(av);\n",
+    "    if (rc != 0) {\n",
+    "        fprintf(stderr, \"E: %s: %s\\n\", name, out ? out : \"failed\");\n",
+    "        free(out);\n",
+    "        return 1;\n",
+    "    }\n",
+    "    if (var) zt_setvar(var, out ? out : \"\");\n",
+    "    else if (out) { fputs(out, stdout); fputc('\\n', stdout); fflush(stdout); }\n",
+    "    free(out);\n",
+    "    return 0;\n",
+    "}\n",
     NULL
 };
 
@@ -3279,20 +3648,9 @@ static void append_rt(dstring *d, const char *const *lines) {
     for (; *lines; lines++) dstr_append_cstr(d, *lines);
 }
 
-#define ZTSL_LIBDIR "/usr/lib/ztsl"
-
-/* def_mod NAME -> /usr/lib/ztsl/NAME-<arch>.so (libs are written in C).
- * 'libztsl' is the built-in runtime: ztc ignores it and compiles the program. */
-static char *mod_path(const char *name) {
-    struct utsname u;
-    const char *arch = (uname(&u) == 0) ? u.machine : "unknown";
-    size_t n = strlen(ZTSL_LIBDIR) + strlen(name) + strlen(arch) + 8;
-    char *path = xmalloc(n);
-    snprintf(path, n, "%s/%s-%s.so", ZTSL_LIBDIR, name, arch);
-    return path;
-}
-
-static int transpile_to_c(ExecCtx *ctx, const char *out_path) {
+/* keep_c: -e keeps <out>.c next to the executable; -o builds from a temporary
+ * file that is removed again. */
+static int transpile_to_c(ExecCtx *ctx, const char *out_path, bool keep_c) {
     Func *f = ctx->prog->funcs;
     Func *rev = NULL;
     while (f) {
@@ -3320,6 +3678,10 @@ static int transpile_to_c(ExecCtx *ctx, const char *out_path) {
         libs = xrealloc(libs, sizeof(char *) * (nlibs + 1));
         libs[nlibs++] = path;
     }
+
+    if (g_ztv == ZTV_ZTSL26)
+        for (Func *fn = ctx->prog->funcs; fn; fn = fn->next)
+            stmts_collect_rtvars(fn->body, ctx);
 
     bool exec_used = false;
     int  gen_rc = 0;
@@ -3367,6 +3729,7 @@ static int transpile_to_c(ExecCtx *ctx, const char *out_path) {
         "#include <stdio.h>\n"
         "#include <stdlib.h>\n"
         "#include <string.h>\n"
+        "#include <ctype.h>\n"
         "#include <stdbool.h>\n"
         "#include <unistd.h>\n"
         "#include <sys/wait.h>\n"
@@ -3396,6 +3759,15 @@ static int transpile_to_c(ExecCtx *ctx, const char *out_path) {
         free(names);
         append_rt(&src, ZT26_RT_SRC);
         dstr_append_cstr(&src, "\n");
+        for (size_t mi = 0; mi < ctx->prog->nmods; mi++) {
+            bool has = false;
+            for (size_t li = 0; li < ctx->prog->nlstmts; li++)
+                if (ctx->prog->lstmts[li].mod == mi) has = true;
+            if (!has) continue;
+            char *sym = mod_symbol(ctx->prog->mods[mi]);
+            dstr_appendf(&src, "extern const ztsl_module %s;\n", sym);
+            free(sym);
+        }
     }
     if (exec_used) {
         dstr_append_cstr(&src,
@@ -3494,8 +3866,20 @@ static int transpile_to_c(ExecCtx *ctx, const char *out_path) {
     }
 
     char cpath[1024];
-    snprintf(cpath, sizeof(cpath), "%s.c", out_path);
-    FILE *cf = fopen(cpath, "w");
+    FILE *cf = NULL;
+    if (keep_c) {
+        snprintf(cpath, sizeof(cpath), "%s.c", out_path);
+        cf = fopen(cpath, "w");
+    } else {
+        const char *tmpd = getenv("TMPDIR");
+        snprintf(cpath, sizeof(cpath), "%s/ztc-XXXXXX.c",
+                 (tmpd && *tmpd) ? tmpd : "/tmp");
+        int tfd = mkstemps(cpath, 2);
+        if (tfd >= 0) {
+            cf = fdopen(tfd, "w");
+            if (!cf) { close(tfd); unlink(cpath); }
+        }
+    }
     if (!cf) {
         zt_error("cannot open %s: %s", cpath, strerror(errno));
         dstr_free(&src);
@@ -3549,12 +3933,18 @@ static int transpile_to_c(ExecCtx *ctx, const char *out_path) {
     free(gcc_argv);
     for (size_t k = 0; k < nlibs; k++) free(libs[k]);
     free(libs);
+    if (!keep_c) unlink(cpath);
     if (rc != 0) {
-        zt_error("gcc failed (rc=%d)", rc);
+        zt_error("gcc failed (rc=%d)%s", rc,
+                 keep_c ? "" : "; re-run with -e to keep the generated C for inspection");
         return rc;
     }
-    fprintf(stderr, "Generated C code and ELF in %s and %s%s\n", out_path, cpath,
-            g_memchk ? " (libmemchk)" : "");
+    if (keep_c)
+        fprintf(stderr, "Generated C code and ELF in %s and %s%s\n", out_path, cpath,
+                g_memchk ? " (libmemchk)" : "");
+    else
+        fprintf(stderr, "Generated ELF in %s%s\n", out_path,
+                g_memchk ? " (libmemchk)" : "");
     return 0;
 }
 
@@ -3564,9 +3954,10 @@ static void usage(const char *argv0) {
         "Usage: %s [options] [target ...]\n"
         "       %s -o <out> <file.ztsl> [-libmemchk] [-ztv=<version>]\n"
         "  -f <file>      Build file (default: build.ztsl)\n"
-        "  -e <out>       Transpile to C and produce executable <out>\n"
-        "  -o <out>       Same as -e, but takes the .ztsl path as a\n"
-        "                 positional argument instead of -f\n"
+        "  -e <out>       Transpile to C and build executable <out>; keeps <out>.c\n"
+        "  -o <out>       Build executable <out> from the .ztsl given as a positional\n"
+        "                 argument (instead of -f). No .c file is left behind; use -e\n"
+        "                 to get it\n"
         "  -ztv=<ver>     Language version:\n"
         "                   p26     ZTSL p26 (ztc 0.1), the original syntax (default)\n"
         "                   ztsl26  ZTSL 26  (ztc 0.26): def_mod, run.func, 'if argument',\n"
@@ -3625,12 +4016,13 @@ int main(int argc, char **argv) {
     bool verbose = false;
     bool positional_file = false;
     bool f_given = false;
+    bool keep_c = false;
 
     int opt;
     while ((opt = getopt(argc, argv, "+f:e:o:lFvVh")) != -1) {
         switch (opt) {
             case 'f': build_file = optarg; f_given = true; break;
-            case 'e': exec_out   = optarg; break;
+            case 'e': exec_out   = optarg; keep_c = true; break;
             case 'o': exec_out   = optarg; positional_file = true; break;
             case 'l': list_only  = true;   break;
             case 'F': force      = true;   break;
@@ -3758,6 +4150,7 @@ int main(int argc, char **argv) {
 
     Parser p = { .lb = &lb, .pos = 0, .error = false, .err_msg = NULL };
     Program prog = { .funcs = NULL, .vars = NULL };
+    p.prog = &prog;
     parse_program(&p, &prog);
 
     if (p.error) {
@@ -3798,7 +4191,7 @@ int main(int argc, char **argv) {
                 file_to_lines(ext_content, &elb);
                 free(ext_content);
 
-                Parser ep = { .lb = &elb, .pos = 0, .error = false, .err_msg = NULL };
+                Parser ep = { .lb = &elb, .pos = 0, .error = false, .err_msg = NULL, .prog = &prog };
                 parse_program(&ep, &prog);
                 if (ep.error) {
                     zt_error("parse error in %s: %s",
@@ -3852,7 +4245,7 @@ int main(int argc, char **argv) {
         ctx.verbose = verbose;
         ctx.dry_run = true;
         ctx.force   = force;
-        int rc = transpile_to_c(&ctx, exec_out);
+        int rc = transpile_to_c(&ctx, exec_out, keep_c);
         linebuf_free(&lb);
         var_free(prog.vars);
         func_free(prog.funcs);
